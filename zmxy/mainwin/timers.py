@@ -146,7 +146,17 @@ class TimersMixin:
         """一个定时项到点：按时刻的每个账号排一项（同账号的几个存档在一次执行里依次做）；按开放时段的每个存档排一项（账号级每账号一项）。"""
         if item in globalcfg.CLOCK_ITEMS:
             return [(acc, None, globalcfg.queue_id(item)) for acc, _slots in globalcfg.targets(self.store, item)]
-        return [(acc, slot, item) for acc, slots in globalcfg.targets(self.store, item) for slot in slots]
+        full = timeplan.full(globalcfg.section(self.store, item), servertime.clock().strftime("%Y-%m-%d"))
+        out, skipped = [], []
+        for acc, slots in globalcfg.targets(self.store, item):
+            for slot in slots:
+                if globalcfg.retry_key(acc.get("username", ""), slot) in full:
+                    skipped.append(self.store.label(acc) + ("" if slot is None else f" · 存档 {slot}"))
+                else:
+                    out.append((acc, slot, item))
+        if skipped:  # “都做”：前一场已经做满的存档，这一场不登录
+            self._timed_note("、".join(skipped), "info", f"「{self._title(item)}」今天前一场已经做满，这一场不登录")
+        return out
 
     def _retry_due(self, item: str, key: str) -> list[Queued]:
         user, slot = globalcfg.split_key(key)
@@ -187,6 +197,18 @@ class TimersMixin:
             self._timed_note("—", "info", "网络已连上，开始补做")
         self._net_wait_since, self._net_noted = None, False
         self._tick_timers()
+
+    def _timed_full(self, name: str, r: core.TaskResult) -> None:
+        """按开放时段的定时任务回报“今天已做满”：记下这个存档，这一天后面的场次不再登录（timeplan.mark_full）。"""
+        queued = self.timed_items.get(name)
+        if queued is None or not r.day_done or r.status == core.PROGRESS or r.task not in timeplan.SESSION_TASKS:
+            return
+        acc, slot, _tid = queued
+        if r.task in globalcfg.WIDE_ITEMS:
+            slot = None  # 账号级：表里按账号记
+        timeplan.mark_full(globalcfg.section(self.store, r.task), servertime.clock().strftime("%Y-%m-%d"),
+                           globalcfg.retry_key(acc.get("username", ""), slot))
+        self.store.save()
 
     def _timed_failed(self, name: str, r: core.TaskResult) -> None:
         """按开放时段的定时登录时网络失败：在同一开放时段里给这个存档约好下一次（timeplan.schedule_retry），记进定时记录。"""
@@ -288,6 +310,7 @@ class TimersMixin:
             if len(accounts) != 1 or core.hosting(user) is None or core.inject(accounts[0]) is not None:
                 return False
             self.timed_inserted.add((accounts[0].name, tid))
+            self.timed_items[accounts[0].name] = (acc, slot, tid)  # 结果回来时要知道是哪个存档（做满了没有）
             self._timed_note(name, "info", f"「{title}」到点，已插入正在进行的执行")
             return True
         self._index_targets()

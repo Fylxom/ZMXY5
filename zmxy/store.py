@@ -188,18 +188,6 @@ class Store:
             if isinstance(sv, dict) and off.intersection(sv.get("tasks", ())):
                 sv["tasks"] = [t for t in sv["tasks"] if t not in off]
 
-    def switch_on(self, task_ids: Iterable[str], only: tuple[dict[str, Any], int] | None = None) -> None:
-        """打开这些任务的开关；默认所有账号、所有存档，only 可限制到一个存档。"""
-        on = list(dict.fromkeys(task_ids))
-        for sv in self._saves_of(only):
-            if not isinstance(sv, dict) or not isinstance(sv.get("tasks"), (list, tuple)):
-                continue
-            tasks = list(sv["tasks"])
-            for tid in on:
-                if tid not in tasks:
-                    tasks.append(tid)
-            sv["tasks"] = tasks
-
     def add_resume(self, acc: dict[str, Any], slot: int, tasks: list[str]) -> None:
         cfg = self.save_cfg(acc, slot)
         cfg["resume"] = list(dict.fromkeys([*cfg.get("resume", ()), *tasks]))

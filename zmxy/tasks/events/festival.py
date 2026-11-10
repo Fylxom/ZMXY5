@@ -6,7 +6,9 @@
 * 每日战斗目标（最高连击 / 击败怪物 / 使用法宝）映射到首场副本的结算字段，关卡道具在副本内使用。
   按 日常任务 → 主线 → 精英 复用已选的第一场副本；三个都没选且战斗目标未完成时，用主线第一关失败结算兜底，不拾取、不增加通关记录。
 * 炼丹炉：只在勾选的类别里找已解锁、材料够的普通配方，炼一次。
-* 在线目标：最后才等，等够后在同一连接直接领取再刷新确认；重新进角会重置客户端计时，所以中间不刷新，也不要求先变 READY。
+* 在线目标和全部领取在 ``stage``（在线阶段）里做：本存档其他任务都做完后；同账号多个存档时等所有存档的其他任务做完、
+  重新登录再做（和在线福利同一次登录）。本体按正常顺序只做炼丹炉、副本兜底，不领取。
+  等够后在同一连接直接领取再刷新确认；重新进角会重置客户端计时，所以中间不刷新，也不要求先变 READY。
 * 等级奖励：按盛典积分算等级，免费档总领，``open`` 有档位 2 才领付费档。不自动使用清心符。
 """
 
@@ -542,7 +544,6 @@ class _Run:
         if stop and not ctx.stopped:
             self.issues.append(f"主线第一关已结算，但副本执行未正常结束：{stop}")
         self.reload("主线第一关已结算")
-        self.claim_ready()
 
     def online(self) -> None:
         tasks = self.daily_tasks(_ONLINE, "do_online")
@@ -587,18 +588,34 @@ class _Run:
         if len(self.level_claimed) >= MAX_LEVEL_CLAIMS:
             self.level_issue = f"达到等级奖励单次领取上限 {MAX_LEVEL_CLAIMS}，停止继续领取"
 
-    def execute(self) -> None:
+    def actions(self) -> None:
+        """本体（正常顺序）：炼丹炉、副本兜底；不领取。"""
         runner = dungeon_runner(self.ctx)
         if runner and (battle_item_plan(self.ctx)[0] or _battle_stats_for(self.info, self.helper, self.ctx.now)):
             self.reused = runner
+        self.compose()
+        if runner is None:
+            self.main_fallback()
+        self.check_items(runner)
+
+    def finish(self) -> None:
+        """在线阶段：等在线目标，然后领任务奖励（领完露出新的炼丹炉目标就补做再领）和等级奖励。"""
+        self.online()
         self.claim_ready()
         self.compose()
         self.claim_ready()
-        if runner is None:
-            self.main_fallback()
-        self.online()
-        self.check_items(runner)
         self.claim_levels()
+
+    def action_result(self) -> TaskResult:
+        parts = ["炼丹炉已炼制"] if self.composed else []
+        if self.fallback_used:
+            parts.append("主线第一关已失败结算（不增加通关记录、不拾取掉落）")
+        elif self.reused:
+            parts.append(f"战斗目标已按{_DUNGEONS[self.reused]}复用副本")
+        text = ("盛典每日目标：" + "、".join(parts) if parts else "盛典每日目标暂无要做的") + dungeon.gain_note(self.gains)
+        notes = (["用户停止"] if self.ctx.stopped else []) + (["每日目标执行问题：" + "；".join(self.issues)] if self.issues else [])
+        status = BLOCKED if self.issues else SUBMITTED if self.composed or self.fallback_used else SKIPPED
+        return TaskResult(ID, status, "；".join([text, *notes]))
 
     def detail(self, suffix: str = "") -> str:
         parts = [f"{label} {len(ids)} 项" for label, ids in (("任务奖励", self.claimed), ("等级奖励", self.level_claimed)) if ids]
@@ -637,7 +654,7 @@ class _Run:
     writes=dungeon.ROUTES[dungeon.MAIN] | {quest.R_COMMIT, R_LEVEL_CLAIM, R_USE_ITEM, R_COMPOSE},
     group="活动",
     last=True,
-    after_saves=True,
+    stage=lambda ctx: _stage(ctx),
     window=is_open,
     choices=Choices(
         lambda: [(ident, name) for ident, (name, _) in _LEVEL_ITEMS.items()],
@@ -662,6 +679,32 @@ class _Run:
     ),
 )
 def run(ctx: TaskContext) -> TaskResult:
+    job = _start(ctx)
+    if isinstance(job, TaskResult):
+        return job
+    try:
+        job.actions()
+    except _Halt as exc:
+        return TaskResult(ID, BLOCKED, job.detail(str(exc)))
+    except (data.DataError, p.AllianceError) as exc:
+        return TaskResult(ID, BLOCKED, job.detail(f"盛典执行中断：{exc}"))
+    return job.action_result()
+
+
+def _stage(ctx: TaskContext) -> TaskResult:
+    job = _start(ctx)
+    if isinstance(job, TaskResult):
+        return job
+    try:
+        job.finish()
+    except _Halt as exc:
+        return TaskResult(ID, BLOCKED, job.detail(str(exc)))
+    except (data.DataError, p.AllianceError) as exc:
+        return TaskResult(ID, BLOCKED, job.detail(f"盛典执行中断：{exc}"))
+    return job.result()
+
+
+def _start(ctx: TaskContext) -> "_Run | TaskResult":
     if ctx.now is None:
         return TaskResult(ID, BLOCKED, "缺少服务器时间，无法判断盛典任务页是否开放；未领取")
     try:
@@ -677,11 +720,4 @@ def run(ctx: TaskContext) -> TaskResult:
     statuses, records = quest.status(info), _quest_records(info)
     if statuses is None or records is None:
         return TaskResult(ID, BLOCKED, "服务器未返回可读取的 quest 列表；未领取")
-    job = _Run(ctx, helper, pages, info, statuses, records)
-    try:
-        job.execute()
-    except _Halt as exc:
-        return TaskResult(ID, BLOCKED, job.detail(str(exc)))
-    except (data.DataError, p.AllianceError) as exc:
-        return TaskResult(ID, BLOCKED, job.detail(f"盛典执行中断：{exc}"))
-    return job.result()
+    return _Run(ctx, helper, pages, info, statuses, records)

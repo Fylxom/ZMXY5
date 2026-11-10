@@ -163,7 +163,7 @@ class _Run:
         return TaskResult(ID, SUBMITTED if self.got else SKIPPED, "；".join(parts) or "在线福利后续奖励已领取")
 
 
-@task(ID, "在线福利", writes={quest.R_COMMIT}, group="活动", terminal=True)
+@task(ID, "在线福利", writes={quest.R_COMMIT}, group="活动", terminal=True, after_saves=True)
 def run(ctx: TaskContext) -> TaskResult:
     if closed := _closed(ctx.now):
         return closed

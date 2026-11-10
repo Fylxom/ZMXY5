@@ -24,6 +24,16 @@ def reserve_note(names: str, week: int, keep: int, live: Any) -> str:
     return f"{state.GROWTH_WEEKS[week - 1]}养成周快到了，今天要留{names}"
 
 
+def short_reward(text: str) -> str:
+    """上届奖励的摘要缩短到半行放得下（周常页和星斗幻境并排）：两项一样 → “都已领取”；不一样 → “竞技场 已领 · 斗宠 未领”。"""
+    parts = [part.split(" ", 1) for part in text.split(" · ")]
+    if len(parts) > 1 and all(len(p) == 2 for p in parts) and len({p[1] for p in parts}) == 1:
+        return "都" + parts[0][1]
+    for long, short in (("已领取", "已领"), ("未领取", "未领"), ("未读取", "未读")):
+        text = text.replace(long, short)
+    return text
+
+
 class AutoConfigMixin:
     def _build_auto_bar(self, page: QVBoxLayout) -> None:
         bar = hbox(margins=(0, 0, 0, 8))
@@ -104,7 +114,7 @@ class AutoConfigMixin:
         return {"text": text, "pending": pending}
 
     def refresh_reward(self) -> None:
-        self.reward_lbl.setText(self._reward_state().get("text") or "竞技场 未读取 · 斗宠 未读取")
+        self.reward_lbl.setText(short_reward(self._reward_state().get("text") or "竞技场 未读取 · 斗宠 未读取"))
 
     def auto_config_run(self) -> None:
         """“自动配置并执行”：先自动配置，再执行次数大于 0 的周常、限时抢购和没领的上届奖励。"""

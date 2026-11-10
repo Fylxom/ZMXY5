@@ -49,6 +49,7 @@ class TaskResult:
     popup: Mapping[str, Any] | None = None  # 只在前台界面显示的结果弹窗数据，不写入设置或日志文件
     log: bool = True  # 事件层：仅补充已显示结果的资料时为 False，仍处理保存但不再新增日志
     retry_in: float | None = None  # 过这么多秒再重跑本任务（逃跑禁赛等）：执行器先做后面的任务，到时间再回来；配合 pending=True
+    day_done: bool = False  # 这个存档今天的次数已经做满（按游戏每日上限）：定时“都做”时后面的场次不再登录
 
 
 class UncertainOutcome(RuntimeError):
@@ -154,6 +155,7 @@ class TaskSpec:
     auto: Callable[["TaskContext"], int | tuple | None] | None = None  # 周常页“自动配置”：登录后只读地算出这个存档现在拥有的最大次数；None = 读不到，不改输入框；返回元组 = 状态说明，原样交给界面（不是次数）
     defer_until: tuple[int, int] | None = None  # 服务器时间（servertime.clock）早于该时刻时，运行器先执行其他任务，到点后再执行
     after_saves: bool = False  # 有同账号多个存档时，等它们各自的其他任务都结束后再执行（长在线等待）
+    stage: Callable[["TaskContext"], "TaskResult | None"] | None = None  # 在线阶段（等在线时长再领奖）：本存档其他任务都做完、terminal 任务之前执行；同账号多个存档时，等所有存档的其他任务做完再重新登录做（和 after_saves 任务同一次登录）。结果并入该任务那一行
     needs: tuple[tuple[str, ...], ...] | None = None  # 必须选了才做的选项：每组里至少一个键不为空；None = 有网格就是网格那一项（见 unpicked）
 
     def __post_init__(self) -> None:

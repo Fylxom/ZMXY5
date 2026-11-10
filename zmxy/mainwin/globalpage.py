@@ -16,7 +16,7 @@ from PySide6.QtWidgets import QGridLayout, QSizePolicy, QVBoxLayout, QWidget
 from .. import globalcfg, online, servertime, state, timeplan, timerlog
 from . import rules
 from ..store import WEEKDAYS, parse_clock
-from ..widgets import (SUB, Card, Check, Chip, ClockField, Field, RButton, Segmented, Select, Switch, clear_layout, hbox, hint, label,
+from ..widgets import (SUB, Card, Check, Chip, ClockField, Field, RButton, Segmented, Select, Switch, clear_layout, elide_label, hbox, hint, label,
                        set_tip, tip, vbox)
 
 NAME_WIDTH = 108  # 时间设置里定时项名字的宽度
@@ -94,7 +94,8 @@ class GlobalMixin:
                  "  开着“按养成周”：养成周开始那天、最后一天也做；平时少用几次，开始那天攒满。"
                  "妖塔、十绝阵等最多攒 5 次，选的星期隔超过 5 天会浪费。",
                  "  养成周开始那天游戏没更新就先不做，早上 8 点起每 30 分钟看一次，更新了再做。",
-                 "· 有开放时间的：选中午场、晚上场或都做，开场后几分钟开始。世界Boss周末 9–21 点按 15:00 分两场，“都做”= 中午做了晚上不做。",
+                 "· 有开放时间的：选中午场、晚上场或都做，开场后几分钟开始。“都做”时中午已做满（次数用完）的存档晚上不登录；"
+                 "世界Boss周末 9–21 点按 15:00 分两场，中午做了晚上不做。",
                  "· 护送经书一条船 15 分钟：时段里能发几条发几条；发完或下一条回来时已关门就不等，经书留到下次领。",
                  "· 报名：报名期里开机联网就报，报过了跳过。",
                  "",
@@ -138,8 +139,6 @@ class GlobalMixin:
         grid.setRowMinimumHeight(r, 28)
         name = label(globalcfg.TITLES[item])
         name.setFixedWidth(NAME_WIDTH)
-        if item in timeplan.TIMER_IDS:
-            tip(name, f"开放时间：{timeplan.describe(item)}")
         grid.addWidget(name, r, 0)
         growth = self._growth_switch(item, cfg) if item == timeplan.WORLD else []  # 世界Boss那一行时间那一列放不下：按养成周放在星期后面
         if item in (globalcfg.WEEKLY, timeplan.WORLD):  # 选星期
@@ -149,9 +148,8 @@ class GlobalMixin:
             days.setSpacing(3)
             grid.addLayout(days, r, 1)
         elif item in timeplan.TIMER_IDS:
-            when = label(timeplan.describe(item), 9, SUB)
-            when.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Preferred)  # 窗口窄时挤的是这段说明
-            tip(when, timeplan.describe(item))
+            when = elide_label(timeplan.describe(item), 9, SUB)  # 窗口窄时挤的是这段：放不下才省略、鼠标停上去看全文
+            when.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Preferred)
             grid.addWidget(when, r, 1)
         grid.addLayout(self._pack(self._item_controls(item, cfg), stretch_start=True), r, 2)
         grid.addWidget(Switch(cfg.get("on") is True, lambda k=item: self._toggle_global(k)), r, 3)
@@ -331,10 +329,35 @@ class GlobalMixin:
 
     # ---- 保存
     def _global_changed(self) -> None:
+        self._settle_clocks()
         self.store.save()
         self._schedule_applied = None  # 后台定时要不要登记可能变了
         self._sync_schedule()
         self.refresh_global_status()
+
+    def remember_clocks(self) -> None:
+        """记下各按时刻定时项现在“今天会不会到点”，改设置后和它比（启动时、每次改完）。"""
+        now = servertime.clock()
+        self._clock_keys = {item: globalcfg.clock_key(self.store, item, now) for item in globalcfg.ITEMS}
+
+    def _settle_clocks(self) -> None:
+        """改了设置让某项今天会到点：已经过了的时间 / 已经开场过的这一场不补做（之前一打开开关、改时间框里每敲一个数字都立刻做一遍）。
+        按开放时段的：先撤掉今天跳过的场次，再按新设置看（改回“这一场还没到点”就照常做）；真做过的场次不再做。"""
+        now = servertime.clock()
+        old = getattr(self, "_clock_keys", {})
+        for item in globalcfg.ITEMS:
+            key = globalcfg.clock_key(self.store, item, now)
+            if old.get(item) == key:
+                continue
+            if item in globalcfg.CLOCK_ITEMS:
+                if key[0] and key[2]:
+                    globalcfg.settle(self.store, item, now)
+            else:
+                cfg = globalcfg.section(self.store, item)
+                timeplan.unskip(item, cfg, now)
+                if key[0]:
+                    timeplan.settle(item, cfg, now)
+        self.remember_clocks()
 
     def _save_global_clock(self, item: str) -> None:
         if self._loading_global:
@@ -345,9 +368,7 @@ class GlobalMixin:
         clock = f"{at // 60:02d}:{at % 60:02d}"
         cfg = globalcfg.section(self.store, item)
         if cfg.get("at") != clock:
-            cfg.pop("done", None)  # 改了时间：今天还能按新时间到点一次
-            cfg.pop("check", None)
-            cfg["at"] = clock
+            globalcfg.retime(self.store, item, clock, servertime.clock())  # 今天做过的从明天起；没做过的新时间今天没到就今天做
             self._global_changed()
 
     def _save_session(self, item: str, value: str) -> None:

@@ -476,6 +476,9 @@ def one_match(ctx: TaskContext, uid: str, season: dict) -> str:
         ctx.engage(False)
 
 
+SPENT = "今日保护次数已用完，停止"
+
+
 def _matches(ctx: TaskContext, uid: str, season: dict, notes: list[str]) -> tuple[str, bool]:
     """一场接一场打，每场结果记进 notes。返回 (停止原因, 是不是中途出问题)。"""
     while True:
@@ -485,7 +488,7 @@ def _matches(ctx: TaskContext, uid: str, season: dict, notes: list[str]) -> tupl
             left = protect_left(ctx, season)  # 每场前按最新结算更新：输一场用掉一次，打人机不会
             ctx.log(f"斗神大会：今日剩余保护次数 {left}")
             if left <= 0:
-                return "今日保护次数已用完，停止", False
+                return SPENT, False
             before = season["protectUsed"], state.num(season.get("score"))
             notes.append(one_match(ctx, uid, season))
         except NoRobots as stop:
@@ -526,4 +529,5 @@ def run(ctx: TaskContext) -> TaskResult:
         return ban.result(ID, f"已完成 {len(notes)} 场" if notes else "")
     # 每一场的结果当场已经写过日志，这里只写场数
     status = SUBMITTED if notes and not incomplete else BLOCKED
-    return TaskResult(ID, status, f"完成 {len(notes)} 场；{why}" if notes else why)
+    full = why == SPENT  # 今日保护次数用完：定时后面的场次不用再登录
+    return TaskResult(ID, status, f"完成 {len(notes)} 场；{why}" if notes else why, day_done=full)

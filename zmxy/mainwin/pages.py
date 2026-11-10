@@ -9,9 +9,9 @@ from PySide6.QtWidgets import QGridLayout, QLabel, QSizePolicy, QStackedWidget, 
 
 from .. import core, pickup
 from ..tasks import boss_raid, last_rewards, pet_catch, refine, time_boat, warehouse_sync
-from ..widgets import (ACCENT, SUB, TEXT, WARN, Card, Chip, Field, RButton, Segmented, Switch, elide_label, font, hbox, hint, label, scroll_page, set_fg, tip, vbox)
+from ..widgets import (ACCENT, SUB, TEXT, WARN, Card, Chip, Field, FlowLayout, RButton, Segmented, Switch, elide_label, font, hbox, hint, label, scroll_page, set_fg, tip, vbox)
 from .parts import TaskRow
-from .rules import DISPLAY_ORDER, DISPLAY_RANK, GROUP_ORDER, HIDDEN, LIMITED, OPEN_HOURS, WEEKLY, WEEKLY_BOTTOM
+from .rules import DISPLAY_ORDER, DISPLAY_RANK, GROUP_ORDER, HIDDEN, LIMITED, OPEN_HOURS, TONGTIAN, WEEKLY, WEEKLY_BOTTOM
 
 
 SHORT_TITLES = {"teacher_trial": "师徒·师傅", "teacher_trial_student": "师徒·徒弟", "pet_arena_apply": "斗宠报名",
@@ -20,6 +20,10 @@ GROUP_NOTES = {  # 组名旁边“说明”里的文字
     "其他": "账号级任务：每个账号做一次，用行上“选存档”选的存档，不看上面选的范围。",
     "已结束": "档期已过，或这个存档已经做完（云梯、玄女战记、登录有礼）。识别时开关已关掉，要做可以手动再开。",
 }
+WEEKLY_LAYOUT = (  # 周常那一块的摆放顺序（两个一行，同类挨着）：师徒 / 留次数的塔 / 副本 / 商店；摘要长的独占一行放最后
+    "teacher_trial", "teacher_trial_student", "demon_tower", "ten_jue", "ancient_wilderness", "tree_king_nightmare",
+    "limited_time_shop", "fairy_flag_shop", "star_maze", "last_rewards", "world_boss")
+WEEKLY_WIDE = ("world_boss",)  # 摘要长（存档·档位·祖巫），半行放不下：独占一行；上届奖励的摘要缩短后和星斗幻境并排（autoconfig.short_reward）
 WEEKLY_MODULES = (time_boat.ID, pet_catch.ID, pet_catch.BUY_ID, pet_catch.star_seal.ID, "pet_cultivation")  # 周常页里有自己的模块，不进通用任务表
 
 
@@ -128,7 +132,8 @@ class PagesMixin:
         """周常页：一行两个任务，各列上下对齐（任务名 | 选了什么 | 选择按钮 | 次数 | 执行 | 自动执行开关）。
         时光之舟、宠物捕捉是自己的模块；UID 查询放最底下。"""
         specs = [sp for sp in self.specs.values() if sp.group == WEEKLY and sp.id not in WEEKLY_MODULES + WEEKLY_BOTTOM + HIDDEN + OPEN_HOURS]
-        specs.sort(key=lambda sp: DISPLAY_RANK.get(sp.id, len(DISPLAY_ORDER)))
+        specs.sort(key=lambda sp: (WEEKLY_LAYOUT.index(sp.id) if sp.id in WEEKLY_LAYOUT else len(WEEKLY_LAYOUT),
+                                   DISPLAY_RANK.get(sp.id, len(DISPLAY_ORDER))))
         self.weekly_ids = [sp.id for sp in specs if sp.times_max]
         self.auto_ids = [sp.id for sp in specs if sp.auto]  # 自动配置要读的：有次数的 + 上届奖励的领取状态
         self.weekly_run_ids = [sp.id for sp in specs]
@@ -140,7 +145,7 @@ class PagesMixin:
             "名字红：养成周快到了，今天要留次数（见上面“按养成周留次数”）。\n"
             "十绝阵按 3000 分结算，上古蛮荒按多人结算。\n"
             "师徒试炼：师傅带过一个徒弟即每周 18 次。"))
-        self._weekly_card(page, "有开放时间", [self.specs[t] for t in OPEN_HOURS], note=self._open_hours_note())
+        self._open_hours_card(page)
         self._build_boat(page)
         self._build_pet_catch(page)
         self._weekly_card(page, "查询", [self.specs[t] for t in WEEKLY_BOTTOM])  # 和定时无关，放最底下
@@ -159,11 +164,47 @@ class PagesMixin:
         page.addWidget(WeeklyCard([self._weekly_item(sp, switches) for sp in ordered]))
         page.addSpacing(8)
 
+    def _open_hours_card(self, page: QVBoxLayout) -> None:
+        """有开放时间的：同类的放一组（斗神和乱斗、通天河三项、两个报名），不写开放时间（用户 2026-11-10：大家都知道）；
+        每个任务的按钮紧跟在它的文字后面，一行放不下就折行，不为了对齐留空白。"""
+        head = label("有开放时间", 9, SUB)
+        head.setContentsMargins(2, 0, 2, 3)
+        page.addWidget(head)
+        card = Card(padx=12, pady=6)
+        col = card.box()
+        col.setSpacing(6)
+        for title, ids in (("对战", ("pvp_match", "pet_brawl")), ("通天河", TONGTIAN), ("报名", ("arena_apply", "pet_arena_apply"))):
+            row = hbox(spacing=0)
+            name = label(title, 9, SUB)
+            name.setFixedWidth(52)
+            row.addWidget(name, 0, Qt.AlignTop)
+            items = QWidget()
+            flow = FlowLayout(items, hspace=28, vspace=4)
+            for tid in ids:
+                flow.addWidget(self._compact_item(self._weekly_item(self.specs[tid], False)))
+            row.addWidget(items, 1)
+            col.addLayout(row)
+        page.addWidget(card)
+        page.addSpacing(8)
+
+    @staticmethod
+    def _compact_item(cells: dict[str, Any]) -> QWidget:
+        """一个任务紧凑地排成一条：名字、选了什么（太长省略，鼠标停上去看全文）、按钮、次数、执行，挨着放。"""
+        item = QWidget()
+        row = hbox(item, spacing=6)
+        middle = cells["middle"]
+        middle.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Preferred)
+        middle.setMaximumWidth(260)
+        for key in ("name", "middle", "buttons", "count", "exec", "switch"):
+            if key in cells:
+                row.addWidget(cells[key])
+        return item
+
     @staticmethod
     def _weekly_long(spec: core.TaskSpec) -> bool:
         """按钮多（选择 + 选存档、刷新 + 选存档）或行上有档位的任务，半行放不下，独占一行。"""
         buttons = bool(spec.choices) + (spec.account_wide and spec.id != boss_raid.WORLD_ID)
-        return buttons > 1 or bool(spec.modes and not (spec.choices and spec.choices.mode_inside))
+        return spec.id in WEEKLY_WIDE or buttons > 1 or bool(spec.modes and not (spec.choices and spec.choices.mode_inside))
 
     def _weekly_item(self, spec: core.TaskSpec, switch: bool) -> dict[str, Any]:
         """一个任务的各格控件（{列名: 控件}），由 WeeklyCard 摆位置。"""
@@ -196,12 +237,8 @@ class PagesMixin:
             mid.addWidget(self.wide_labels[spec.id])
             btns.addWidget(RButton("选存档", lambda s=spec: self.choose_save(s), "side", height=22, size=9))
         if spec.id == last_rewards.ID:  # 自动配置读到的领取状态
-            self.reward_lbl = elide_label("未读取", 9, SUB)
+            self.reward_lbl = elide_label("都未读取", 9, SUB)
             mid.addWidget(self.reward_lbl, 1)
-            stretched = True
-        elif mid.count() == 0 and spec.id in OPEN_HOURS:  # 没有别的可显示：写开放时间
-            from .. import timeplan
-            mid.addWidget(elide_label(timeplan.describe(spec.id).replace("每天 ", ""), 9, SUB), 1)
             stretched = True
         if not stretched:
             mid.addStretch(1)
@@ -219,14 +256,6 @@ class PagesMixin:
         if switch and spec.id in self.weekly_run_ids and not spec.account_wide:  # 世界Boss有自己的定时，没有开关
             self.weekly_vars[spec.id] = cells["switch"] = Switch(False, self.save_weekly)
         return cells
-
-    @staticmethod
-    def _open_hours_note() -> str:
-        from .. import timeplan
-        rows = [("斗神大会", "pvp_match"), ("灵宠乱斗", "pet_brawl"), ("通天河", "tongtian_hire"), ("世界Boss", timeplan.WORLD),
-                ("竞技场 / 斗宠大会报名", "arena_apply")]
-        return "\n".join(["开放时间（读数据表，游戏改了跟着变）："] + [f"  {name}：{timeplan.describe(tid)}" for name, tid in rows]
-                         + ["", "定时在账号栏最上面的“定时”里设。"])
 
     def _build_toolbar(self) -> Any:
         """最上面一行：账号标题、范围（当前存档/当前账号/全部账号）、执行、停止。"""

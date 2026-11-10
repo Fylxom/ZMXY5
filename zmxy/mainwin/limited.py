@@ -43,7 +43,7 @@ class LimitedMixin:
         self.exec_btns["limited:read"] = RButton("识别结束活动", self.limited_read, "side", height=22, size=9, width=88)
         head.addWidget(self.exec_btns["limited:read"])
         head.addSpacing(8)
-        head.addWidget(hint("按服务器时间和数据表档期，把过期的活动移到“已结束”并关掉开关（所有账号共用），重新开放的打开。\n"
+        head.addWidget(hint("按服务器时间和数据表档期，把过期的活动移到“已结束”并关掉开关（所有账号共用）；重新开放的移回上面，开关不动。\n"
                             "数据表换新版后，第一次执行有存档进角时顺带识别一次。\n"
                             "云梯、玄女战记、登录有礼按存档自己做没做完算，只关那个存档的开关。"))
         head.addSpacing(10)
@@ -136,12 +136,8 @@ class LimitedMixin:
 
     def _on_limited(self, data: Any) -> None:  # 活动页“识别”的结果：dict = {at, ended}，str = 错误说明
         if isinstance(data, dict):
-            previous = self.store.data.get("limited")
-            old_ended = known_ids(previous.get("ended", ())) if isinstance(previous, dict) else set()
-            active_ids = {sp.id for sp in self.limited_specs} - set(ALWAYS_LISTED)
-            returned = (old_ended - known_ids(data.get("ended", ()))) & active_ids
             self.store.data["limited"] = {**data, "tables": tables.TABLE_ROOT.name}  # 按哪一版数据表识别的
-            self.store.switch_on(returned)  # 上次识别已结束、本次重新开放：恢复活动开关
+            # 重新开放的只移回“活动”块，开关不自动打开（用户要求，2026-11-10）
             self.store.switch_off(data.get("ended", ()))  # 档期已过的：开着的关掉（只在识别这一下，之后可以手动再打开）
             self.store.save()
             self._build_limited()
@@ -153,11 +149,7 @@ class LimitedMixin:
         acc, slot, flags = data
         for key, flag in flags.items():
             if flag is not None:
-                profile = self.store.save_cfg(acc, slot).setdefault("profile", {})
-                was_ended = profile.get(key) is True
-                profile[key] = flag
+                self.store.save_cfg(acc, slot).setdefault("profile", {})[key] = flag
                 if flag:
-                    self.store.switch_off([SAVE_END[key]], (acc, slot))  # 只关这个存档的开关，不锁定
-                elif was_ended:
-                    self.store.switch_on([SAVE_END[key]], (acc, slot))  # 活动返场时只重开这个存档
+                    self.store.switch_off([SAVE_END[key]], (acc, slot))  # 只关这个存档的开关，不锁定；重新开放不自动打开
         self.store.save()

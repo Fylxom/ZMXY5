@@ -9,6 +9,8 @@
 * 报名类（APPLY_TASKS）：竞技场 / 斗宠大会报名，报名期（ChallengeApply，周五 16:00–周日 22:00）里第一次看到就去报，不用填时间。
 
 做过的记在 cfg["done"] = {"day": 时段所在的日期, "windows": [时段序号]}（整个定时项一份，到点时选中的存档一起排队）；报名类的 day 是这一届报名期开始那天。
+  "skip": [时段序号] = 刚打开 / 改设置时这一场已经过了开始时间，不补做（settle），设置再改时会重新看（unskip）；
+  "full": [登录名#存档] = 这一天已经做满（任务结果 day_done），后面的场次不再登录。
 登录时网络失败（连不上 4399 / 游戏服务器）：同一时段内过 RETRY_AFTER 分钟各再试一次，按 “登录名#存档” 各记各的，在 cfg["retry"][键]。
 """
 
@@ -193,8 +195,53 @@ def _done(cfg: dict[str, Any], day: str) -> list[int]:
     return []
 
 
-def _mark(cfg: dict[str, Any], day: str, window: int) -> None:
-    cfg["done"] = {"day": day, "windows": sorted(set(_done(cfg, day)) | {window})}
+def _list(cfg: Mapping[str, Any], day: str, key: str) -> list[Any]:
+    done = cfg.get("done")
+    if isinstance(done, dict) and done.get("day") == day and isinstance(done.get(key), list):
+        return list(done[key])
+    return []
+
+
+def _mark(cfg: dict[str, Any], day: str, window: int, skip: bool = False) -> None:
+    old = cfg.get("done") if isinstance(cfg.get("done"), dict) and cfg["done"].get("day") == day else {}
+    skipped = sorted(set(_list(cfg, day, "skip")) | {window}) if skip else [w for w in _list(cfg, day, "skip") if w != window]
+    cfg["done"] = {**{k: v for k, v in old.items() if k != "skip"}, "day": day, "windows": sorted(set(_done(cfg, day)) | {window}),
+                   **({"skip": skipped} if skipped else {})}
+
+
+def settle(tid: str, cfg: Any, now: datetime) -> None:
+    """设置刚改成“这一场会做”（打开、换场次、改开场后几分钟、勾上存档）：这一场已经过了开始时间就不补做，等下一场（调用方负责 save）。
+    报名类不管：报名期好几天，中途打开也要去报。"""
+    if tid not in SESSION_TASKS or not valid(tid, cfg):
+        return
+    here = current(tid, cfg, now)
+    if here is None:
+        return
+    day, window, _last = here
+    wins, _split = sessions(tid, now.weekday())
+    if window not in _done(cfg, day) and now.hour * 60 + now.minute >= wins[window].start + delay_of(cfg):
+        _mark(cfg, day, window, skip=True)
+
+
+def unskip(tid: str, cfg: Any, now: datetime) -> None:
+    """改设置前先撤掉今天“跳过”的场次（真做过的留着）；之后 settle 按新设置重新看（调用方负责 save）。"""
+    if tid not in SESSION_TASKS or not isinstance(cfg, dict):
+        return
+    day = now.strftime("%Y-%m-%d")
+    skipped = set(_list(cfg, day, "skip"))
+    if skipped:
+        cfg["done"] = {**{k: v for k, v in cfg["done"].items() if k != "skip"}, "windows": [w for w in _done(cfg, day) if w not in skipped]}
+
+
+def full(cfg: Any, day: str) -> set[str]:
+    """这一天已经做满的 “登录名#存档”。"""
+    return {k for k in _list(cfg, day, "full") if isinstance(k, str)} if isinstance(cfg, dict) else set()
+
+
+def mark_full(cfg: dict[str, Any], day: str, key: str) -> None:
+    """这个存档今天做满了（任务结果 day_done）：后面的场次不再登录（调用方负责 save）。"""
+    old = cfg.get("done") if isinstance(cfg.get("done"), dict) and cfg["done"].get("day") == day else {"day": day, "windows": []}
+    cfg["done"] = {**old, "full": sorted(full(cfg, day) | {key})}
 
 
 def current(tid: str, cfg: Mapping[str, Any], now: datetime) -> tuple[str, int, int] | None:
@@ -237,7 +284,7 @@ def due(tid: str, cfg: Any, now: datetime) -> bool:
         wins, split = sessions(tid, now.weekday())
         if minute < wins[window].start + delay_of(cfg):
             return False
-        if split and window > 0 and _done(cfg, day):  # 劈开的一整段：中午场已经运行过，晚上场不再做
+        if split and window > 0 and set(_done(cfg, day)) - set(_list(cfg, day, "skip")):  # 劈开的一整段：中午场真运行过（不是跳过），晚上场不再做
             return False
     _mark(cfg, day, window)
     cfg.pop("retry", None)

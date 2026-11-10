@@ -258,7 +258,7 @@ def _plan(ctx: TaskContext, times: int):
         return TaskResult(ID, BLOCKED, "读不到今日请教次数（everyDaySetting.tongtianRiverRobNum），未请教")
     left = min(max(0, cap - used), times)
     if left == 0:
-        return TaskResult(ID, SKIPPED, "今日请教次数已用完")
+        return TaskResult(ID, SKIPPED, "今日请教次数已用完", day_done=True)
     mine = my_level_power(ctx)
     if mine is None:
         return TaskResult(ID, BLOCKED, "读不到角色等级/战力，无法按客户端门槛筛选目标，未请教")
@@ -342,7 +342,9 @@ def run(ctx: TaskContext) -> TaskResult:
     gains = dungeon.Gains()
     done, why, failed = _hunt(ctx, chosen, wanted, ship, prior, left, mine, gains)
     note = f"{ship}请教 {done} 次" + dungeon.gain_note(gains)
+    used, cap = state.used(ctx.info, "tongtianRiverRobNum"), state.num(common().get("tongtianRiverRobNum"))
+    full = used is not None and bool(cap) and used + done >= cap  # 进角时已用的 + 这次请教的 到了每日上限
     if why:
         status = BLOCKED if failed else SUBMITTED if done else SKIPPED
-        return TaskResult(ID, status, f"{note}；{why}" if done else why)
-    return TaskResult(ID, SUBMITTED, note)
+        return TaskResult(ID, status, f"{note}；{why}" if done else why, day_done=full)
+    return TaskResult(ID, SUBMITTED, note, day_done=full)

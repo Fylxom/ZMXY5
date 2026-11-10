@@ -131,6 +131,64 @@ def elide_label(text: str = "", size: int = 10, color: str = TEXT) -> ElideLabel
     return w
 
 
+class FlowLayout(QLayout):
+    """从左往右排，一行放不下就折到下一行；每个控件按自己的宽度，不和别的行对齐，右边不留硬凑出来的空白。"""
+
+    def __init__(self, parent: QWidget | None = None, hspace: int = 24, vspace: int = 4) -> None:
+        super().__init__(parent)
+        self.setContentsMargins(0, 0, 0, 0)
+        self.items: list[Any] = []
+        self.hspace, self.vspace = hspace, vspace
+
+    def addItem(self, item: Any) -> None:
+        self.items.append(item)
+
+    def count(self) -> int:
+        return len(self.items)
+
+    def itemAt(self, i: int) -> Any:
+        return self.items[i] if 0 <= i < len(self.items) else None
+
+    def takeAt(self, i: int) -> Any:
+        return self.items.pop(i) if 0 <= i < len(self.items) else None
+
+    def expandingDirections(self) -> Qt.Orientations:
+        return Qt.Orientations(0)
+
+    def hasHeightForWidth(self) -> bool:
+        return True
+
+    def heightForWidth(self, width: int) -> int:
+        return self._place(QRectF(0, 0, width, 0).toRect(), False)
+
+    def setGeometry(self, rect: Any) -> None:
+        super().setGeometry(rect)
+        self._place(rect, True)
+
+    def sizeHint(self) -> QSize:
+        return self.minimumSize()
+
+    def minimumSize(self) -> QSize:
+        size = QSize()
+        for item in self.items:
+            size = size.expandedTo(item.minimumSize())
+        return size
+
+    def _place(self, rect: Any, apply: bool) -> int:
+        x, y, line = rect.x(), rect.y(), 0
+        for item in self.items:
+            if item.widget() is not None and item.widget().isHidden():
+                continue  # 藏起来的不占位置
+            hint = item.sizeHint()
+            if x > rect.x() and x + hint.width() > rect.right() + 1:
+                x, y, line = rect.x(), y + line + self.vspace, 0
+            if apply:
+                item.setGeometry(QRectF(x, y, hint.width(), hint.height()).toRect())
+            x += hint.width() + self.hspace
+            line = max(line, hint.height())
+        return y + line - rect.y()
+
+
 def apply_theme(app: Any) -> None:
     """启动时调用一次：字体、底色、文字颜色、滚动条样式。"""
     app.setFont(font(10))
@@ -572,6 +630,109 @@ class ClockField(Field):
         if not self.valid():
             self.set(self.good)
         super().focusOutEvent(e)
+
+
+class LinkRow(_Hoverable):
+    """设置卡片里整行可点的一行：左边名称，右边灰字和“›”；鼠标移上去整行变浅灰。"""
+
+    def __init__(self, title: str, detail: str, on_click: Callable[[], None], height: int = 40) -> None:
+        super().__init__()
+        self.title, self.detail, self.on_click = title, detail, on_click
+        self.setFixedHeight(height)
+        self.setCursor(Qt.PointingHandCursor)
+
+    def mousePressEvent(self, e: Any) -> None:
+        if e.button() == Qt.LeftButton:
+            self.on_click()
+
+    def paintEvent(self, e: Any) -> None:
+        p = QPainter(self)
+        p.setRenderHint(QPainter.Antialiasing)
+        w, h = self.width(), self.height()
+        if self.hover:
+            p.setPen(Qt.NoPen)
+            p.setBrush(QColor("#EAEAEE"))
+            p.drawRoundedRect(QRectF(0, 0, w, h), 8, 8)
+        p.setFont(font(10))
+        p.setPen(QColor(TEXT))
+        title_w = measure(font(10), self.title)
+        p.drawText(QRectF(10, 0, w - 20, h), Qt.AlignLeft | Qt.AlignVCenter, self.title)
+        p.setFont(font(12))
+        p.setPen(QColor("#B0B0B6"))
+        p.drawText(QRectF(0, 0, w - 10, h - 2), Qt.AlignRight | Qt.AlignVCenter, "›")
+        room = w - 10 - 16 - 10 - title_w - 16
+        p.setFont(font(9))
+        p.setPen(QColor(SUB))
+        p.drawText(QRectF(0, 0, w - 10 - 16, h), Qt.AlignRight | Qt.AlignVCenter, fit(font(9), self.detail, max(0, room)))
+
+
+class TextButton(_Hoverable):
+    """只有文字的小按钮（蓝字，鼠标移上去变深）：放在一行里不抢眼的次要操作。"""
+
+    def __init__(self, text: str, command: Callable[[], None], size: int = 9, height: int = 26) -> None:
+        super().__init__()
+        self.text, self.command, self.enabled = text, command, True
+        self.f = font(size)
+        self.setFixedSize(measure(self.f, text) + 12, height)
+        self.setCursor(Qt.PointingHandCursor)
+
+    def set_enabled(self, enabled: bool) -> None:
+        self.enabled = bool(enabled)
+        self.setCursor(Qt.PointingHandCursor if self.enabled else Qt.ArrowCursor)
+        self.update()
+
+    def set_text(self, text: str) -> None:
+        self.text = text
+        self.setFixedWidth(measure(self.f, text) + 12)
+        self.update()
+
+    def mousePressEvent(self, e: Any) -> None:
+        if e.button() == Qt.LeftButton and self.enabled:
+            self.command()
+
+    def paintEvent(self, e: Any) -> None:
+        p = QPainter(self)
+        p.setFont(self.f)
+        p.setPen(QColor("#C2C2C7" if not self.enabled else "#0958D6" if self.hover else ACCENT))
+        p.drawText(self.rect(), Qt.AlignCenter, self.text)
+
+
+class ProgressBar(QWidget):
+    """细长的圆角进度条。set(0–1)；None = 不知道总量（只画底）。"""
+
+    def __init__(self, height: int = 4) -> None:
+        super().__init__()
+        self.frac: float | None = 0.0
+        self.setFixedHeight(height)
+
+    def set(self, frac: float | None) -> None:
+        self.frac = None if frac is None else max(0.0, min(1.0, frac))
+        self.update()
+
+    def paintEvent(self, e: Any) -> None:
+        p = QPainter(self)
+        p.setRenderHint(QPainter.Antialiasing)
+        p.setPen(Qt.NoPen)
+        r = self.height() / 2
+        p.setBrush(QColor("#E3E3E8"))
+        p.drawRoundedRect(QRectF(self.rect()), r, r)
+        if self.frac:
+            p.setBrush(QColor(ACCENT))
+            p.drawRoundedRect(QRectF(0, 0, max(self.height(), self.width() * self.frac), self.height()), r, r)
+
+
+def divider(inset: int = 10) -> QWidget:
+    """卡片里两行之间的细线（左右各缩进 inset）。"""
+    holder = QWidget()
+    lay = hbox(holder, margins=(inset, 0, inset, 0))
+    line = QWidget()
+    line.setFixedHeight(1)
+    line.setAutoFillBackground(True)
+    pal = line.palette()
+    pal.setColor(QPalette.Window, QColor(LINE))
+    line.setPalette(pal)
+    lay.addWidget(line)
+    return holder
 
 
 class AccountRow(_Hoverable):

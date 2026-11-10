@@ -88,6 +88,22 @@ def _join(*notes: str) -> str:
     return "；".join(note for note in notes if note)
 
 
+def _combine(prev: TaskResult, new: TaskResult) -> TaskResult:
+    """同一任务后来的结果（收尾、在线阶段）并入先前那一行。"""
+    bad = new.status in (BLOCKED, ERROR, UNCERTAIN, PAUSED)
+    if prev.pending:  # 临时结果只是占位：最终结果整个替换它
+        status, detail = new.status, new.detail
+    else:
+        status = new.status if bad or (prev.status == SKIPPED and new.status == SUBMITTED) else prev.status
+        detail = _join(prev.detail, new.detail)
+    return TaskResult(
+        prev.task, status, detail, prev.profile,
+        todo=_join(prev.todo, new.todo),
+        account_profile=new.account_profile or prev.account_profile,
+        popup=new.popup or prev.popup,
+    )
+
+
 def _with_profile(result: TaskResult, profile: Mapping[str, Any]) -> TaskResult:
     """任务改过登录账号状态、结果里又没带：带上一份，界面据此保存。"""
     return replace(result, account_profile=dict(profile)) if profile and result.account_profile is None else result
@@ -108,6 +124,8 @@ class _AccountRun:
         self.waiting = False  # 宿主任务正空等着（护送等船）：这时没有任务在做，界面可以再点“执行”插任务
         self.alias: str | None = None  # 正在做插进来的任务时：它自己的执行项名字（结果、日志记在它名下，可能是另一个存档）
         self.finals: dict[str, TaskResult] = {}  # 任务穿插着做完时报过的最终结果（ctx.report）：没等到本体/收尾就被停止、中断时用它
+        self.stages_done = False
+        self.stage_only: set[str] = set()  # stage="only"：这些任务只做在线阶段（本体之前那次登录已经做过）
         self.reported_finals: dict[tuple[str, str], TaskResult] = {}  # 执行项、任务 -> ctx.report 已显示的最终结果
         self.later: list[tuple[float, int, TaskSpec]] = []  # 要过一会儿再重跑的任务（TaskResult.retry_in）：(到点 monotonic, 第几轮, 任务)
 
@@ -331,18 +349,7 @@ class _AccountRun:
         if prev is None:
             self.record(new)
             return
-        bad = new.status in (BLOCKED, ERROR, UNCERTAIN, PAUSED)
-        if prev.pending:  # 临时结果只是占位：最终结果整个替换它
-            status, detail = new.status, new.detail
-        else:
-            status = new.status if bad or (prev.status == SKIPPED and new.status == SUBMITTED) else prev.status
-            detail = _join(prev.detail, new.detail)
-        results[results.index(prev)] = merged = TaskResult(
-            task_id, status, detail, prev.profile,
-            todo=_join(prev.todo, new.todo),
-            account_profile=new.account_profile or prev.account_profile,
-            popup=new.popup or prev.popup,
-        )
+        results[results.index(prev)] = merged = _combine(prev, new)
         self.emit_result(self.name, merged)
 
     def past_midnight(self, spec: TaskSpec) -> TaskResult | None:
@@ -355,7 +362,7 @@ class _AccountRun:
     def preludes(self, chosen: list[TaskSpec]) -> None:
         """前置步骤：先于所有任务（含 first）；prelude_late 的排在其他前置步骤之后。"""
         for spec in sorted(chosen, key=lambda spec: spec.prelude_late):
-            if spec.prelude is None or stopping(self.stop):
+            if spec.prelude is None or spec.id in self.stage_only or stopping(self.stop):
                 continue
             if late := self.past_midnight(spec):
                 self.record(late)
@@ -369,12 +376,33 @@ class _AccountRun:
                 self.halted = True
                 return
 
+    def stages(self, chosen: list[TaskSpec]) -> None:
+        """在线阶段（TaskSpec.stage）：本存档其他任务都做完以后做，只做一次。stage=later 时只提示稍后再做。"""
+        if self.stages_done:
+            return
+        self.stages_done = True
+        for spec in chosen:
+            if spec.stage is None or spec.id in self.aborted or self.over:
+                continue
+            if self.account.stage == "later":
+                self.emit(self.name, TaskResult(spec.id, PROGRESS, "在线任务和领奖等同一账号其他存档的任务做完后再做"))
+                continue
+            only = spec.id in self.stage_only
+            late = self.past_midnight(spec)
+            result, must_stop = (late, False) if late else self.execute(spec, spec.stage)
+            if result is not None:
+                if only:
+                    self.record(result)
+                else:
+                    self.merge(spec.id, result)
+            self.halted = self.halted or must_stop
+
     def finales(self, chosen: list[TaskSpec]) -> None:
         """收尾（领取）。"""
         for spec in chosen:
             if self.halted:
                 return
-            if spec.finale is None or spec.id in self.aborted or stopping(self.stop):
+            if spec.finale is None or spec.id in self.aborted or spec.id in self.stage_only or stopping(self.stop):
                 continue
             result, must_stop = self.execute(spec, spec.finale)
             if result is not None:
@@ -393,7 +421,11 @@ class _AccountRun:
                 self.finales(chosen)
                 if self.halted:
                     break
-            if spec.id in self.aborted:
+            if spec.terminal:
+                self.stages(chosen)  # 在线阶段排在 terminal 任务（在线福利）之前：它们的在线时长跟着多算
+                if self.halted:
+                    break
+            if spec.id in self.aborted or spec.id in self.stage_only:
                 continue
             if stopping(self.stop):
                 why = _SKIP_STOPPED if self.stopped else "已按要求打完这一场后停止"
@@ -412,6 +444,7 @@ class _AccountRun:
             if self.account.tidy and ran % self.account.tidy == 0:
                 self.tidy()
         self.laters()
+        self.stages(chosen)
         if not self.over:
             self.interleave()
         if not finales_done and not self.over:
@@ -550,6 +583,8 @@ def run_account(
         with _signed_in(account) as session:
             session.peers, session.owns_login = account.peers, True
             run.session, run.chosen = session, tuple(spec.id for spec in chosen)
+            if account.stage == "only":
+                run.stage_only = {spec.id for spec in chosen if spec.stage is not None}
             day = day if day is not None else [None]
             if day[0] is None:
                 day[0] = daycut.day_of(getattr(session, "now", None))
@@ -598,7 +633,7 @@ class _LoginBatch:
     after_saves 任务放到最后。"""
 
     def __init__(self, registry: Mapping[str, TaskSpec], stop: threading.Event | None,
-                 emit: Callable[[str, TaskResult], None], collect: Callable[[str, list[TaskResult]], None]) -> None:
+                 emit: Callable[[str, TaskResult], None], collect: Callable[..., list[TaskResult]]) -> None:
         self.registry, self.stop, self.emit, self.collect = registry, stop, emit, collect
         self.halt: str | None = None  # 同账号后面的任务为什么不做了：paused / uncertain / stopped
         self.day: list = [None]  # 这次执行开始那天（第一个存档登录时的服务器日期），各存档共用
@@ -607,6 +642,10 @@ class _LoginBatch:
         last: list[tuple[Account, str]] = []
         if len(group) > 1:
             group, last = self._take_out(group, lambda spec: spec.after_saves and "等同一账号其他存档的任务完成后再等待在线时长")
+            staged = [(acc, t) for acc in group for t in acc.tasks if getattr(self.registry.get(t), "stage", None)]
+            later = {acc.name for acc, _ in staged}
+            group = [replace(acc, stage="later") if acc.name in later else acc for acc in group]
+            last = staged + last  # 同一存档的在线阶段和 after_saves 任务一次登录做完
         now = servertime.clock()
 
         def deferred_note(spec: TaskSpec) -> str | None:
@@ -619,9 +658,13 @@ class _LoginBatch:
         done = self._run_saves(group)
         for acc, tid in deferred:
             self._run_deferred(acc, tid, done)
+        rounds: dict[str, tuple[Account, list[str]]] = {}
         for acc, tid in last:
-            if not self._held(acc, tid, _LAST_HELD):
-                self._run_alone(acc, tid)
+            rounds.setdefault(acc.name, (acc, []))[1].append(tid)
+        for acc, tids in rounds.values():
+            tids = [t for t in tids if not self._held(acc, t, _LAST_HELD)]
+            if tids:
+                self._finish(acc, self._attempt(replace(acc, tasks=tuple(tids), stage="only")), merge=True)
 
     def _take_out(self, group: list[Account], note: Callable[[TaskSpec], Any]) -> tuple[list[Account], list[tuple[Account, str]]]:
         """把 note 给出说明的任务从各执行项里拿出来（并显示说明）。返回 (剩下的执行项, 拿出来的任务)。"""
@@ -718,8 +761,10 @@ class _LoginBatch:
         self.emit(acc.name, result)
         return [result]
 
-    def _finish(self, acc: Account, results: list[TaskResult]) -> None:
-        self.collect(acc.name, results)
+    def _finish(self, acc: Account, results: list[TaskResult], merge: bool = False) -> None:
+        """merge：在线阶段那次登录的结果并入这个存档先前同一任务那一行（界面也更新成合并后的）。"""
+        for r in self.collect(acc.name, results, merge):
+            self.emit(acc.name, r)
         statuses = {r.status for r in results}
         if UNCERTAIN in statuses:
             self.halt = "uncertain"
@@ -742,9 +787,20 @@ def run_batch(
     out: dict[str, list[TaskResult]] = {}
     lock = threading.Lock()
 
-    def collect(name: str, results: list[TaskResult]) -> None:
+    def collect(name: str, results: list[TaskResult], merge: bool = False) -> list[TaskResult]:
+        """记下结果；merge 时同一任务已有一行就并进去，返回并好的那些行。"""
+        merged: list[TaskResult] = []
         with lock:
-            out[name] = [*out.get(name, ()), *results]
+            rows = list(out.get(name, ()))
+            for r in results:
+                at = next((i for i in range(len(rows) - 1, -1, -1) if rows[i].task == r.task), None) if merge else None
+                if at is None:
+                    rows.append(r)
+                else:
+                    rows[at] = _combine(rows[at], r)
+                    merged.append(rows[at])
+            out[name] = rows
+        return merged
 
     def run_group(group: list[Account]) -> None:
         _LoginBatch(registry, stop, emit, collect).run(group)

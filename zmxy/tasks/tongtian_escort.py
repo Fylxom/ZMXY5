@@ -46,12 +46,12 @@ def hire(ctx: TaskContext) -> TaskResult:
     if applied is None:
         return TaskResult(ID_HIRE, BLOCKED, "读不到今日报名状态（everyDaySetting），未报名")
     if applied >= 1:
-        return TaskResult(ID_HIRE, SKIPPED, "今日已报名")
+        return TaskResult(ID_HIRE, SKIPPED, "今日已报名", day_done=True)
     try:
         ctx.request(R_APPLY, {})
     except p.AllianceError as exc:
         return TaskResult(ID_HIRE, BLOCKED, f"报名失败：{exc}")
-    return TaskResult(ID_HIRE, SUBMITTED, "已报名雇佣")
+    return TaskResult(ID_HIRE, SUBMITTED, "已报名雇佣", day_done=True)
 
 
 def refresh_plan(options: Mapping[str, Any]) -> list[int]:
@@ -268,7 +268,7 @@ class Voyage:
         note = f"护送 {self.sailed} 条船，刷新 {self.spent} 次" + dungeon.gain_note(self.gains) + (f"；{self.closed}" if self.closed else "")
         if self.why:
             return TaskResult(ID_ESCORT, BLOCKED, f"{note}；{self.why}" if self.sailed else self.why)
-        return TaskResult(ID_ESCORT, SUBMITTED, note)
+        return TaskResult(ID_ESCORT, SUBMITTED, note, day_done=self.trips >= self.cap)  # 船发满了（最后一条的经书下次运行时领，隔天也领得到）
 
 
 def refresh_counts(acc: Mapping[str, Any]) -> list[tuple[int, str]]:
@@ -288,7 +288,7 @@ def voyage(ctx: TaskContext) -> Voyage | TaskResult:
     if not cap or not refresh_cap or trips is None or refreshed is None or river is None:
         return TaskResult(ID_ESCORT, BLOCKED, "读不到今日护送/刷新次数或通天河数据（进角信息），未护送")
     if not escort_of(river) and trips >= cap:
-        return TaskResult(ID_ESCORT, SKIPPED, "今日护送次数已用完")
+        return TaskResult(ID_ESCORT, SKIPPED, "今日护送次数已用完", day_done=True)
     if not escort_of(river) and (why := timeplan.closed(ID_ESCORT, ctx.now)):  # 有上次留下的船照样去领
         return TaskResult(ID_ESCORT, SKIPPED, f"{why}，未护送")
     found = ctx.session._voyage = Voyage(ctx, river, trips, cap, refresh_cap, refreshed)

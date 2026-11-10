@@ -9,7 +9,7 @@ from PySide6.QtWidgets import QGridLayout, QHBoxLayout, QVBoxLayout
 
 from .. import core, results
 from ..tasks import time_boat
-from ..widgets import LINE, SUB, TEXT, WARN, Card, Field, RButton, Switch, ask_confirm, hbox, hint, label, notice, set_fg
+from ..widgets import LINE, SUB, TEXT, WARN, Card, Field, RButton, Switch, ask_confirm, elide_label, hbox, hint, label, notice, set_fg
 from .parts import EnergyBar, Fill
 from .running import read_error
 
@@ -53,7 +53,7 @@ class BoatMixin:
         self.remind_var = Switch(bool((self.store.data.get("ui") or {}).get("remind", True)), self._toggle_remind)
         top.addWidget(self.remind_var)
         top.addStretch(1)
-        self.boat_status = label("", 9, SUB)
+        self.boat_status = elide_label("", 9, SUB)  # 窄了省略，不把整页撑宽
         top.addWidget(self.boat_status)
         top.addSpacing(8)
         self.exec_btns["time_boat:read"] = RButton("读取", self.boat_read, "side", height=22, size=9, width=50)
@@ -65,8 +65,9 @@ class BoatMixin:
         grid.setContentsMargins(0, 0, 0, 0)
         grid.setHorizontalSpacing(0)
         grid.setVerticalSpacing(8)
-        for c, weight in enumerate((3, 2, 2, 2)):
-            grid.setColumnStretch(c, weight)
+        for c, width in enumerate((90, 72, 72, 72, 60)):  # 各列按内容定宽、靠左，不按比例撑满整张卡片
+            grid.setColumnMinimumWidth(c, width)
+        grid.setColumnStretch(9, 1)
         for c, text in enumerate(("兑换目标", "每次消耗", "本周剩余", "挑战次数", "兑换次数")):
             grid.addWidget(label(text, 9, SUB), 0, c)
         for r, (oid, name, cost, _remain, _fight) in enumerate(time_boat.board({})["rows"], start=1):

@@ -95,6 +95,8 @@ class EventsMixin:
         timed = name in self.timed_names or (name, r.task) in self.timed_inserted
         if name in self.timed_names and r.status != core.PROGRESS:
             self._timed_failed(name, r)
+        if timed and r.status != core.PROGRESS:
+            self._timed_full(name, r)
         if timed and r.log:  # 仅补充资料的结果不重复写入定时日志
             timerlog.write(shown_name(name), title, STATUS_LABEL.get(r.status, r.status), r.detail or "")
             if r.status != core.PROGRESS:

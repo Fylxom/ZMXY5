@@ -430,7 +430,7 @@ def _gate(ctx: TaskContext) -> tuple[int, int, int] | TaskResult:
     if got is None:
         return TaskResult(ID, BLOCKED, f"读不到今日已得乱斗币（everyDaySetting.{KEY}），未匹配")
     if got >= cap:
-        return TaskResult(ID, SKIPPED, f"今日乱斗币已达上限 {got}/{cap}")
+        return TaskResult(ID, SKIPPED, f"今日乱斗币已达上限 {got}/{cap}", day_done=True)
     opened = open_now(ctx.now)
     if opened is None:
         return TaskResult(ID, BLOCKED, "读不到服务器时间或开放时间表，未匹配")
@@ -464,6 +464,7 @@ def run(ctx: TaskContext) -> TaskResult:
         return ban.result(ID, f"已打 {len(day.notes)} 场，今日乱斗币 {day.got}/{cap}" if day.notes else "")
     notes, why = day.notes, day.why
     note = f"打了 {len(notes)} 场，今日乱斗币 {day.got}/{cap}" + (f"（另有 {day.replays} 场对手中途退出没给币，已重开）" if day.replays else "")
+    full = day.got >= cap
     if why:
-        return TaskResult(ID, SUBMITTED if notes and not day.incomplete else BLOCKED, f"{note}；{why}" if notes else why)
-    return TaskResult(ID, SUBMITTED, note)
+        return TaskResult(ID, SUBMITTED if notes and not day.incomplete else BLOCKED, f"{note}；{why}" if notes else why, day_done=full)
+    return TaskResult(ID, SUBMITTED, note, day_done=full)

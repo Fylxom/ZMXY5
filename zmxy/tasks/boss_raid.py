@@ -260,6 +260,7 @@ class WorldRun:
 
     def __init__(self, ctx: TaskContext, info: Mapping[str, Any], names: dict, queue: list[int], gear: str, chances: int, level: int | None, profile: dict | None) -> None:
         self.ctx, self.names, self.queue, self.gear, self.chances = ctx, names, queue, gear, chances
+        self.all_in = False  # 这次的场数就是今天该打的全部：打完 = 今天做满（world_boss 设）
         self.level, self.profile = level, profile
         self.uid = state.num(info.get("uid"))
         self.skip_gold = bool(ctx.options.get(SKIP_GOLD))
@@ -290,7 +291,8 @@ class WorldRun:
     def over(self, status: str, note: str, completed: bool = False) -> TaskResult:
         # 已完成的场次可以正常返回 submitted；后续查询/进场/结算失败必须保留 blocked，不能被前面的成功场次掩盖。
         final = SUBMITTED if self.fought and (status == SKIPPED or completed) else status
-        return TaskResult(WORLD_ID, final, "；".join(self.fought + ([note] if note else [])), self.profile)
+        full = self.chances <= 0 and self.all_in
+        return TaskResult(WORLD_ID, final, "；".join(self.fought + ([note] if note else [])), self.profile, day_done=full)
 
     def fight_in(self, boss_id: int, found: Mapping[str, Any], joined: Mapping[str, Any], high_power: float | None) -> TaskResult | tuple:
         """进了房间以后：打一场，不管怎么结束都退房、记录。返回 TaskResult（到此为止）或 (结果, 说明, 房间, 那一场到点的时刻)。"""
@@ -460,18 +462,20 @@ def world_boss(ctx: TaskContext) -> TaskResult:
     if chances is None:
         return TaskResult(WORLD_ID, BLOCKED, "读不到世界 Boss 挑战次数（worldBoss.count），未进场")
     if chances <= 0:
-        return TaskResult(WORLD_ID, SKIPPED, "没有世界 Boss 挑战次数")
+        return TaskResult(WORLD_ID, SKIPPED, "没有世界 Boss 挑战次数", day_done=True)
     if ctx.options.get("plan") == "growth":  # 定时开着“按养成周”：不看次数框，按现有次数现算
         keep = state.growth_keep(ctx.now, online.growth_week(ctx.now), RESERVE_WEEK)
         if keep is None:
             return TaskResult(WORLD_ID, SKIPPED, f"翅膀光环养成周今天开始，游戏还没更新，{chances} 次全部留着")
         wanted = chances - keep
         if wanted <= 0:
-            return TaskResult(WORLD_ID, SKIPPED, f"现有 {chances} 次，今天要留 {keep} 次给翅膀光环养成周，不打")
+            return TaskResult(WORLD_ID, SKIPPED, f"现有 {chances} 次，今天要留 {keep} 次给翅膀光环养成周，不打", day_done=True)
         if keep:
             ctx.log(f"现有 {chances} 次，留 {keep} 次给翅膀光环养成周，打 {wanted} 场")
     else:
         wanted = state.num(ctx.options.get("times", MAX_FIGHTS)) or 0
     if wanted <= 0:
         return TaskResult(WORLD_ID, SKIPPED, "次数填的 0，不打")
-    return WorldRun(ctx, info, names, queue, gear, min(chances, wanted), level, profile).run()  # 行上填的次数：这次最多打这么多场
+    run = WorldRun(ctx, info, names, queue, gear, min(chances, wanted), level, profile)
+    run.all_in = wanted >= chances or ctx.options.get("plan") == "growth"  # 这次打完就是今天该打的全部（按养成周时留下的晚上也不打）
+    return run.run()  # 行上填的次数：这次最多打这么多场

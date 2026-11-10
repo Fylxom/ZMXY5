@@ -9,11 +9,12 @@ from PySide6.QtWidgets import QGridLayout, QHBoxLayout, QLabel, QVBoxLayout, QWi
 
 from .. import core
 from ..tasks import pet_catch
-from ..widgets import LINE, SUB, Card, Field, RButton, Switch, ask_confirm, hbox, hint, label, vbox
+from ..widgets import LINE, SUB, Card, Field, RButton, Switch, ask_confirm, elide_label, hbox, hint, label, vbox
 from .parts import Fill
 
 
 FIELD_WIDTH = 84  # 本卡片数量及范围输入框统一尺寸
+DETAILS_WIDTH = 160  # 名字后面“选了什么 + 选择”的宽度：三行的次数框上下对齐，又不被推到最右边
 
 
 class PetCardMixin:
@@ -30,6 +31,7 @@ class PetCardMixin:
         self.exec_btns[pet_catch.BUY_ID] = RButton("执行", lambda: self.start(only=pet_catch.BUY_ID), "side", height=26, size=9, width=50)
         material = hbox()
         material.addWidget(label("木灵葫芦", 9, SUB))
+        material.addStretch(1)
         col.addLayout(self._pet_action_row(label("购买葫芦"), "购买数量", self.pet_buy, self.exec_btns[pet_catch.BUY_ID], material))
         self.pet_note = label("筛选只对天马、灵花开放", 9, SUB)
         col.addSpacing(8)
@@ -42,8 +44,8 @@ class PetCardMixin:
 
     def _pet_task_row(self, spec: core.TaskSpec, quantity: str) -> QHBoxLayout:
         target = hbox()
-        self.summaries[spec.id] = label("", 9, SUB)
-        target.addWidget(self.summaries[spec.id])
+        self.summaries[spec.id] = elide_label("", 9, SUB)  # 放不下省略，鼠标停上去看全文
+        target.addWidget(self.summaries[spec.id], 1)
         target.addWidget(RButton("选择", lambda s=spec: self.choose(s), "side", height=26, size=9, width=50))
         self.count_vars[spec.id] = Field(str(spec.times_default), width=FIELD_WIDTH, height=26, on_change=lambda s=spec: self.save_count(s))
         self.exec_btns[spec.id] = RButton("执行", lambda t=spec.id: self.start(only=t), "side", height=26, size=9, width=50)
@@ -63,7 +65,14 @@ class PetCardMixin:
                             "天马、灵花各存一份，按存档各记。\n"
                             "放生不合格的：只放刚捕到、1 级没改名没培养的 1 / 2 星；放不掉就停，不再捕。\n"
                             "读不到要比的字段就停下，不放生。"))
-        line.addStretch(1)
+        line.addSpacing(20)
+        for n in pet_catch.STARS:  # 收哪一星：开关并在这一行，开了的那一星下面显示范围
+            line.addWidget(label(f"{n}星", 9))
+            line.addSpacing(6)
+            self.pet_stars[n] = Switch(False, self._toggle_pet_star)
+            line.addWidget(self.pet_stars[n])
+            line.addSpacing(16)
+        line.addSpacing(8)
         line.addWidget(label("捕到合格停止", 9))
         line.addSpacing(6)
         self.pet_stop = Switch(False, self.save_pet_filter)
@@ -73,19 +82,12 @@ class PetCardMixin:
         line.addSpacing(6)
         self.pet_release = Switch(False, self._toggle_pet_release)
         line.addWidget(self.pet_release)
+        line.addStretch(1)
         box.addLayout(line)
-        for n in pet_catch.STARS:  # 一星一块：标题行（星级 + 收不收的开关），开了才显示下面的资质一行、体质根骨潜力战力一行
-            if n != pet_catch.STARS[0]:
-                box.addSpacing(4)
-            title = hbox(spacing=0)
-            title.addWidget(label(f"{n}星", 10, bold=True))
-            title.addSpacing(8)
-            self.pet_stars[n] = Switch(False, self._toggle_pet_star)
-            title.addWidget(self.pet_stars[n])
-            title.addStretch(1)
-            box.addLayout(title)
+        for n in pet_catch.STARS:  # 开了的那一星才显示：资质一行、天赋一行
             self.pet_groups[n] = QWidget()
             group = vbox(self.pet_groups[n], spacing=6)
+            group.addWidget(label(f"{n}星范围", 9, bold=True))
             box.addWidget(self.pet_groups[n])
             for name, cells in (("资质", pet_catch.STAR_ROWS), ("天赋", pet_catch.TALENT_ROWS)):
                 group.addLayout(self._pet_range_grid(n, name, cells))
@@ -119,13 +121,17 @@ class PetCardMixin:
         row = hbox(spacing=8)
         title.setFixedWidth(90)
         row.addWidget(title)
-        row.addLayout(details)
-        row.addStretch(1)
+        holder = QWidget()  # 固定宽度：次数框紧跟着，几行之间对齐
+        holder.setFixedWidth(DETAILS_WIDTH)
+        details.setContentsMargins(0, 0, 0, 0)
+        holder.setLayout(details)
+        row.addWidget(holder)
         count = label(quantity, 9, SUB)
         count.setFixedWidth(56)
         row.addWidget(count)
         row.addWidget(field)
         row.addWidget(execute)
+        row.addStretch(1)
         return row
 
     def _build_pet_harvest(self, col: QVBoxLayout) -> None:
@@ -137,17 +143,19 @@ class PetCardMixin:
         col.addWidget(rule)
         details = hbox()
         details.addWidget(hint(spec.choices.note))
+        details.addStretch(1)
         self.pet_harvest_count = Field("", width=FIELD_WIDTH, height=26, on_change=self.save_pet_harvest)
         self.pet_harvest_count.setPlaceholderText("留空不刷")
         self.exec_btns[spec.id] = RButton("执行", lambda: self.start(only=spec.id), "side", height=26, size=9, width=50)
-        col.addLayout(self._pet_action_row(self._name_label(spec.id, spec.title, clickable=False),
-                                           "刷取次数", self.pet_harvest_count, self.exec_btns[spec.id], details))
-        flags = hbox()
+        row = self._pet_action_row(self._name_label(spec.id, spec.title, clickable=False),
+                                   "刷取次数", self.pet_harvest_count, self.exec_btns[spec.id], details)
+        col.addLayout(row)
+        flags = hbox(spacing=6, margins=(98, 0, 0, 0))  # 开关另起一行，和上面“说明”对齐（接在执行后面窗口窄时放不下）
         for key, title in spec.choices.toggles:
             flags.addWidget(label(title, 9))
             self.pet_harvest_flags[key] = Switch(False, self.save_pet_harvest)
             flags.addWidget(self.pet_harvest_flags[key])
-            flags.addSpacing(18)
+            flags.addSpacing(12)
         flags.addStretch(1)
         col.addLayout(flags)
 
