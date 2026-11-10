@@ -20,4 +20,5 @@ ZMXY5 程序发布
 | `zmxy/instance.py` | 只允许开一个程序 |
 | `zmxy/appupdate.py` | 从本仓库的 Releases 自动更新 |
 | `zmxy/tasks/` | 一个任务一个文件，`@task` 注册 |
+| `tests/` | 离线测试：用假连接代替游戏服务器，不联网就能检查任务对不对（登录、通讯、激活的测试没有放；数据表快照不在仓库里，需要自己生成） |
 | `docs/TASKS.md` | 给 AI 的交接文档：架构、规则、各模块进度 |
