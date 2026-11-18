@@ -616,8 +616,8 @@ class NoPickupTests(unittest.TestCase):
         for drop, want in (({"type": 2}, "exp"), ({"type": 3}, "spirit"), ({"type": 73}, "pet_exp"),
                            ({"type": "coin", "subType": "spirit"}, "spirit"), ({"type": "petAttr", "subType": "petEXP"}, "pet_exp"),
                            ({"type": 4, "subType": 101014003}, "potion"), ({"type": "item", "itemId": "101014004"}, "potion"),
-                           ({"type": 1}, None), ({"type": 68}, None), ({"type": "item", "subType": "101045121"}, None),
-                           ({"type": "item", "subType": "x"}, None), ({"monsterId": 1, "index": 0}, None)):
+                           ({"type": 1}, "other"), ({"type": 68}, "other"), ({"type": "item", "subType": "101045121"}, "other"),
+                           ({"type": "item", "subType": "x"}, "other"), ({"monsterId": 1, "index": 0}, "other")):
             self.assertEqual(pickup.kind(drop), want, drop)
         for prop in range(101014001, 101014009):                  # 萝卜、蓝瓶、蓝壶、蟠桃各档
             self.assertEqual(pickup.kind({"type": "item", "subType": str(prop)}), "potion")
@@ -643,9 +643,12 @@ class NoPickupTests(unittest.TestCase):
     def test_skipped_drops_send_no_request_and_others_keep_their_positions(self):
         self.assertEqual(self.picked(())[0], [0, 1, 2, 3, 4])
         self.assertEqual(self.picked(["spirit", "potion"])[0], [0, 2, 4])
-        positions, detail = self.picked(self.ALL)
-        self.assertEqual(positions, [4])
+        positions, detail = self.picked([k for k in self.ALL if k != pickup.OTHER])
+        self.assertEqual(positions, [4])  # 不勾“物品”：前四类以外的照捡
         self.assertIn("按设置未拾取 4 项", detail)
+        positions, detail = self.picked(self.ALL)
+        self.assertEqual(positions, [])  # 勾上“物品”：剩下的也不捡
+        self.assertIn("按设置未拾取 5 项", detail)
         self.assertNotIn("未拾取", self.picked(())[1])
 
     def test_nightmare_chest_drops_are_filtered_too(self):

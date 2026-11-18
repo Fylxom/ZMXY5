@@ -13,6 +13,9 @@
 
 出战宠物、宝符可以事先在游戏里配好；没配时服务器随机。匹配超时最多重试 ``MATCH_RETRY_MAX`` 次（不算场次）；其他服务器拒绝、整场超时仍停止。排队中停下会先取消匹配。
 例外（真机 2026-10-09）：对手中途退出时，上报会被拒绝“战斗已完成”、没有结算推送、也不给乱斗币——这一场不算次数，重新开一局（一次执行最多补 ``REPLAY_MAX`` 局）。
+结算 ``winType`` 2 = 战斗异常（游戏里显示“战斗异常”；真机 11-17：第 1 局双方都报输判平、后来对方逃跑，乱斗币+0）同样处理：重读币数，没涨就重开。
+某一局双方都报输，服务器判这局平（``btlWin`` 里是 ``''``），一直如此。
+v4811 起斗神大会每场也给乱斗币（真机 +3），和灵宠乱斗共用 ``addPetPvpM`` 与每日上限，所以开打时币数可能不是 5 的倍数。
 """
 
 from __future__ import annotations
@@ -39,6 +42,8 @@ R_INFO = "scene.petPvpHandler.getPetPVPInfo"  # 客户端打开灵宠乱斗界�
 PREPARE, STAGE, FINISH = "onPrepareCreateOnlineCopy", "onPetPvpBtlChangeState", "onPetPVPFinish"
 MATCH_RESULT, EXIT, ABNORMAL = "onPVPMatchResult", "onPetPvpBtlExit", "onCopyAbnormal"
 ROUTES = (PREPARE, STAGE, FINISH, MATCH_RESULT, EXIT, ABNORMAL)
+# 排查“对手中途逃跑”有没有信号：客户端监听、可能跟房间进出有关的推送，收到只整条写日志、不处理（2026-11-17 加）
+WATCH = ("onPlayerChangeStatus", "onPlayerLeaveWaitingRoom", "onPlayerJoinWaitingRoom", "onKickOutWaitingRoom", "onExitMap")
 PET_BRAWL_DUNGEONS = {2000101, 2000201}  # v4760 LevelConfigVO.isPetBrawl()
 KEY = "addPetPvpM"      # everyDaySetting：今日已得乱斗币
 MATCH_WAIT = 300.0      # 匹配最长等待（用户指定）
@@ -62,7 +67,9 @@ class MatchTimeout(dungeon.Stop):
 
 
 class Fled(Exception):
-    """上报时服务器说“战斗已完成”：这一场已经结束（真机：对手中途退出），没有结算推送。参数 = 打到第几回合。"""
+    """这一场没正常打完、可能不给币，调用方重读乱斗币，没涨就重开（算进 REPLAY_MAX）。参数 =（打到第几回合，说明）。
+    两种来源：上报时服务器说“战斗已完成”、没有结算推送（真机 10-09：对手中途退出）；
+    结算 winType 2 = 战斗异常（真机 11-17：第 1 局双方都报输判平、对方逃跑，乱斗币+0）。"""
 
 
 def helper() -> dict:
@@ -114,6 +121,16 @@ def seats(players, uid: str) -> str:
         who = "我" if _is_me(pl, uid) else f"对手{pl.get('playerId', pl.get('uid'))}"
         out.append(f"{who} 上阵{pl.get('onBtl')} 手牌{pl.get('btlCards')} 加载{pl.get('loading')}" + (f" 血{hp}" if hp else ""))
     return "；".join(out) or "推送里没有座位"
+
+
+def player_flags(players, uid: str) -> str:
+    """排查用：每个座位除宠物明细外的简单字段（看对手逃跑时有没有在线 / 退出之类的标记）。"""
+    out = []
+    for pl in players if isinstance(players, list) else []:
+        if isinstance(pl, dict):
+            flat = {k: v for k, v in pl.items() if isinstance(v, (str, int, float, bool)) or v is None}
+            out.append(("我" if _is_me(pl, uid) else "对手") + str(flat))
+    return "；".join(out)
 
 
 def choose_pet(players, uid: str) -> tuple[int | None, str]:
@@ -220,6 +237,12 @@ class _Match:
             raise dungeon.Stop(f"结算带错误：{b.get('error', '')}")
         add = state.num(b.get("addPetBtlM"))
         notice = b.get("error")
+        if (state.num(b.get("winType")) == 2 and notice in (None, "", "对方已逃跑")
+                and isinstance(b.get("reportId"), str) and b["reportId"].strip()):
+            # winType 2 = 战斗异常（游戏里显示“战斗异常”，斗神大会的 onPVPFinish 也是）；真机 11-17 乱斗币+0。交给调用方重读、没涨就重开
+            why = f"战斗异常（{notice}）" if notice else "战斗异常"
+            self.ctx.log(f"灵宠乱斗：结算为{why}，回执乱斗币+{add if add is not None else '?'}；重读今日币数")
+            raise Fled(self.rounds, f"打了 {self.rounds} 回合，结算为{why}")
         if notice:
             # 客户端先结算/更新次数，再显示 error 提示；实测对方逃跑也可奖励10币。
             # 仅接受这一已知提示且有完整胜场回执；其他异常仍停止。
@@ -244,6 +267,7 @@ class _Match:
         self.session = state.num(b.get("session")) or self.session
         self.ack_at = now + LOAD_DELAY if stage == 1 else None
         ctx.log(f"灵宠乱斗：阶段 {stage}，第 {self.session} 局，{seats(self.players, self.uid)}，倒计时 {b.get('time')}，已赢 {b.get('btlWin')}")
+        ctx.log(f"灵宠乱斗：阶段推送其他字段 {({k: v for k, v in b.items() if k != 'players'})}；座位字段 {player_flags(self.players, self.uid)}")
         if stage == 0:  # 送分玩法：每局摆阵都选战力最低的宠物
             pick, why_pick = choose_pet(self.players, self.uid)
             ctx.log(f"灵宠乱斗：第 {self.session or self.rounds + 1} 局摆阵：{why_pick}")
@@ -278,9 +302,9 @@ class _Match:
                 self.ready_at = self.ack_at = self.report_at = None  # 服务器不再需要（客户端也是收到 500 就停）
                 ctx.log(f"灵宠乱斗：上报被拒绝（{exc}）")
                 if "已完成" in str(exc):  # 这场已经结束：不用再等结算推送，调用方重读今日乱斗币
-                    raise Fled(self.rounds) from exc
+                    raise Fled(self.rounds, f"对手中途退出（{self.rounds} 回合）") from exc
             try:
-                got = ctx.poll_push(ROUTES, 1.0)
+                got = ctx.poll_push(ROUTES + WATCH, 1.0)
             except p.AllianceError as exc:
                 self.connection_lost = True
                 phase = "对局中断" if self.matched else "匹配中断"
@@ -293,7 +317,11 @@ class _Match:
             route, body = got
             b = online.inner(body)
             self.last_push = now
-            ctx.log(f"灵宠乱斗：收到 {route}（开始后 {now - start:.0f} 秒）{str(b)[:160]}")
+            if route in WATCH:  # 只记录
+                ctx.log(f"灵宠乱斗：收到 {route}（开始后 {now - start:.0f} 秒，第 {self.session or 0} 局，阶段 {self.stage}）{b}")
+                continue
+            # 结算推送整条写进日志（截断后看不到 winType 之外的字段，11-17 排查战斗异常时吃过亏）
+            ctx.log(f"灵宠乱斗：收到 {route}（开始后 {now - start:.0f} 秒）{str(b) if route == FINISH else str(b)[:160]}")
             result = self.on_push(route, b, now)
             if result is not None:
                 return result
@@ -388,7 +416,7 @@ class _Day:
             ctx.log(f"灵宠乱斗：{exc}，重新匹配（第 {self.match_retries}/{MATCH_RETRY_MAX} 次重试）")
             return True
         except Fled as exc:
-            fled, note, total = exc, f"对手中途退出（{exc.args[0]} 回合）", None
+            fled, note, total = exc, exc.args[1], None
         except dungeon.Stop as stop:
             if is_kicked(str(stop)) and self.kicks < KICK_RETRY_MAX and not (ctx.stopped or ctx.winding):
                 return self.rejoin(str(stop))
@@ -401,7 +429,7 @@ class _Day:
                 total = None
         if fled and total is not None and total <= self.got:  # 对手跑了、这一场没给币：不算次数，重新开一局
             if self.replays >= REPLAY_MAX:
-                return self.stop(f"对手中途退出、没给币的已经重开 {self.replays} 局，不再重开")
+                return self.stop(f"对手中途退出或战斗异常、没给币的已经重开 {self.replays} 局，不再重开")
             self.replays += 1
             ctx.log(f"灵宠乱斗：{note}，这一场没给乱斗币，不算次数，重新开一局（第 {self.replays} 次重开）")
             return True
@@ -463,7 +491,7 @@ def run(ctx: TaskContext) -> TaskResult:
     except match_start.Banned as ban:  # 逃跑禁赛：先做后面的任务，过几分钟再来（重跑时重读乱斗币）
         return ban.result(ID, f"已打 {len(day.notes)} 场，今日乱斗币 {day.got}/{cap}" if day.notes else "")
     notes, why = day.notes, day.why
-    note = f"打了 {len(notes)} 场，今日乱斗币 {day.got}/{cap}" + (f"（另有 {day.replays} 场对手中途退出没给币，已重开）" if day.replays else "")
+    note = f"打了 {len(notes)} 场，今日乱斗币 {day.got}/{cap}" + (f"（另有 {day.replays} 场对手中途退出或战斗异常没给币，已重开）" if day.replays else "")
     full = day.got >= cap
     if why:
         return TaskResult(ID, SUBMITTED if notes and not day.incomplete else BLOCKED, f"{note}；{why}" if notes else why, day_done=full)

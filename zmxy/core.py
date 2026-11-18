@@ -6,7 +6,7 @@ session.py   Session（受控发包）、TaskContext、Account
 runner.py    run_account / run_batch
 """
 
-from .activity import active_tasks, engaged, force_stop, stop_after
+from .activity import active_tasks, engaged, force_stop, stop_after, stopping
 from .runner import (hosting, inject, pending, read_auto, read_clock, read_info, run_account, run_batch, task_order)
 from .session import Account, Session, TaskContext, TeamLink, login_lock, wanted
 from .taskdef import (BAG_FULL_HINT, BLOCKED, DISPLAY_ORDER, ERROR, FORCE_STOP_HINT, PAUSED, PROGRESS, REGISTRY, SKIPPED,

@@ -9,8 +9,9 @@ from __future__ import annotations
 
 from typing import Any, Callable
 
-from PySide6.QtCore import QEasingCurve, QEvent, QObject, QPoint, QPointF, QRectF, QSize, Qt, QTimer, QVariantAnimation
-from PySide6.QtGui import QColor, QCursor, QFont, QFontMetrics, QGuiApplication, QPainter, QPalette, QPen, QRegion
+from PySide6.QtCore import QEasingCurve, QEvent, QObject, QPoint, QPointF, QRectF, QRegularExpression, QSize, Qt, QTimer, QVariantAnimation
+from PySide6.QtGui import (QColor, QCursor, QFont, QFontMetrics, QGuiApplication, QPainter, QPalette, QPen, QRegion,
+                           QRegularExpressionValidator)
 from PySide6.QtWidgets import QDialog, QFrame, QGridLayout, QHBoxLayout, QLabel, QLayout, QLineEdit, QScrollArea, QVBoxLayout, QWidget
 
 
@@ -576,8 +577,11 @@ class Field(QLineEdit):
     """圆角输入框，聚焦时出现蓝色描边。on_change：内容变了就调（程序改的也调，和原来绑在变量上的行为一样）。"""
 
     def __init__(self, text: str = "", width: int = 300, height: int = 36, password: bool = False,
-                 on_change: Callable[[], None] | None = None, max_len: int | None = None) -> None:
+                 on_change: Callable[[], None] | None = None, max_len: int | None = None, digits: int | None = None) -> None:
+        """digits：只能输数字，最多这么多位（UID、角色编号）。"""
         super().__init__(text)
+        if digits:
+            self.setValidator(QRegularExpressionValidator(QRegularExpression(rf"\d{{0,{digits}}}"), self))
         self.setFixedSize(width, height)
         self.setFont(font(10))
         pad = 10 if width >= 60 else 6

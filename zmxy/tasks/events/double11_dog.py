@@ -1,4 +1,6 @@
-"""抽取狗卡（活动页）：按双十一活动表开放，只用免费次数，每抽一次刷新核对，对不上就停不重发。"""
+"""抽取狗卡（活动页）：按双十一活动表开放，只用免费次数，每抽一次刷新核对，对不上就停不重发。
+“选择”里选了参加的号（options["pool"]，全局设置，由 store.to_account 带进来）就改做狗卡轮转（dog_pool）：
+一整轮同时登录全部参加的号，互送狗卡、集卡；领奖期里领瓜分的元宝。"""
 
 from collections import namedtuple
 from collections.abc import Mapping
@@ -32,6 +34,22 @@ def config():
             or set(str(row.get("subType")).split(";")) != set(keys)):
         raise ValueError("双十一抽卡配置缺失或格式变化")
     return Config(start, reward, base, tuple(sorted(keys)))
+
+
+def season(now):
+    """抽卡期或领奖期（这一行留在活动页上，不进“已结束”）。"""
+    try:
+        cfg = config()
+        return state.activity_open(cfg.start, now) or state.activity_open(cfg.reward, now)
+    except (ValueError, data.DataError):
+        return False
+
+
+def reward_open(now):
+    try:
+        return state.activity_open(config().reward, now)
+    except (ValueError, data.DataError):
+        return False
 
 
 def opened(now):
@@ -69,8 +87,22 @@ def drawn_card(reply, keys):
     return give[0]["subType"]
 
 
-@task(ID, "抽取狗卡", reads={R_DATA}, writes={R_DRAW}, spends={R_DRAW}, group="活动", window=opened)
+from . import dog_pool  # noqa: E402
+
+
+@task(ID, "抽取狗卡", reads={R_DATA}, writes={R_DRAW, dog_pool.R_ACTIVE, dog_pool.R_TO_CODE, dog_pool.R_TO_DOG, dog_pool.R_MONEY},
+      spends={R_DRAW}, group="活动", window=season)
 def run(ctx):
+    pool = ctx.options.get("pool")
+    index = ctx.config.record_index
+    me = dog_pool.key_of(ctx.config.username, index + 1) if isinstance(index, int) else None
+    if me in {dog_pool.key_of(m["user"], m["slot"]) for m in dog_pool.members_of(pool)}:  # 参加轮转的存档做一整轮；没参加的照旧只抽自己
+        if ctx.stopped or ctx.winding:
+            return TaskResult(ID, SKIPPED, "用户停止，未做狗卡轮转")
+        if not season(ctx.now):
+            return TaskResult(ID, SKIPPED, "抽取狗卡尚未开放或已结束（按当前活动表）")
+        labels = ctx.options.get("labels") if isinstance(ctx.options.get("labels"), dict) else {}
+        return dog_pool.run_round(ctx, pool, labels, reward=reward_open(ctx.now), manual=ctx.options.get("manual") is True)
     done, got = 0, {}
     try:
         if ctx.stopped or ctx.winding:

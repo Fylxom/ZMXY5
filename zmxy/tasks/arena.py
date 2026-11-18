@@ -7,6 +7,8 @@
   显示扫荡按钮（``sweepable``），不满足的号位不拿去试；战力读不到的照旧让服务器判断，被明确拒绝（战力/报名等）就换下一位。
   都扫不了、或者扫到一半能量用完，就改手打 8 号位（斗宠没有 8 号位用 1 号位；竞技场没有 8 号位就停），冷却按手打的算；
   改手打的原因写进最终结果。这次改手打**不会改存设置**（旧版会改存）。
+* 指定（手打）：每次都打“选择”里填的那个人（对方 UID + 角色编号 → ``UID_r编号``，就是推荐列表里的 ``rid``、``targetId``）；
+  不要求在推荐的 8 人里。查不到对方资料（没报名等）或服务器不让打 → 剩下的次数改打榜首，结果记“已阻止”（橙色，不显示绿色；2026-11-14 用户要求）。
 * 榜首 / 榜尾（都是手打）：榜首挑战前 8 位里战力最高的（``strongest``，战力读不到就 1 号位），
   榜尾挑战战力最低的（``weakest``，战力读不到就打最后一位）；设置里存的值榜首是 ``manual``（原“手打”，含义没变）、榜尾是 ``bottom``。
   ``beginArenaBattle`` → ``endArenaBattle {targetId, win:1}``；
@@ -224,18 +226,42 @@ def _has_opponent(row) -> bool:
     return bool(state.find(row, *_NAME_KEYS, depth=8) and state.find(row, *_ENTITY_KEYS, depth=8))
 
 
-SWEEP, MANUAL, BOTTOM = "sweep", "manual", "bottom"  # MANUAL = 榜首（沿用原“手打”存的值）
-MODES = [(MANUAL, "榜首"), (BOTTOM, "榜尾"), (SWEEP, "扫荡")]
+SWEEP, MANUAL, BOTTOM, TARGET = "sweep", "manual", "bottom", "target"  # MANUAL = 榜首（沿用原“手打”存的值）
+MODES = [(TARGET, "指定"), (MANUAL, "榜首"), (BOTTOM, "榜尾"), (SWEEP, "扫荡")]  # 指定排在手打（榜首/榜尾）前面（用户要求）
 MODE_NOTE = ("榜首 / 榜尾：前 8 名里打战力最高 / 最低的，直接按胜利结算；两次间隔 10 秒，等的时候穿插别的任务。\n"
-             "扫荡：从 8 号位往前找能扫的；扫不了或能量用完改打 8 号位（斗宠已报名时直接手打）。")
+             "扫荡：从 8 号位往前找能扫的；扫不了或能量用完改打 8 号位（斗宠已报名时直接手打）。\n"
+             "指定：每次都打“选择”里填的那个人，不用在推荐的 8 人里；打不了就改打榜首，结果显示成已阻止（橙色）。")
+TARGET_NOTE = ("角色编号 = 对方账号里第几个创建的角色，从 0 数起，删掉的也算，和存档在第几格无关。\n"
+               "不知道编号：先空着点“预览”，会查对方现在用的角色，并把编号自动填上。\n"
+               "对方要报了名才打得了；打不了（没报名、服务器不让打）就改打榜首，结果显示成已阻止（橙色）。")
+
+
+def target_rid(opts: Mapping) -> str | None:
+    """“选择”里填的 UID + 角色编号 → ``UID_r编号``；没填全或不是数字 = None。"""
+    uid, role = (str(opts.get(k) if opts.get(k) is not None else "").strip() for k in ("target_uid", "target_role"))
+    return f"{int(uid)}_r{int(role)}" if uid.isdigit() and int(uid) > 0 and role.isdigit() else None
+
+
+def target_summary(opts: Mapping) -> str:
+    """行上的灰字。"""
+    rid = target_rid(opts)
+    if rid is None:
+        return "没填对手"
+    uid, _, role = rid.partition("_r")
+    return f"UID {uid} · 编号 {role}"
 
 
 class Job:
     """一项活动（竞技场或斗宠）的执行状态。``step()`` 只发一步（扫荡一次 / 重读推荐后手打一次），**不等待**：
     什么时候能发由 ``ready_at()`` 给出，调用方（``Scheduler``）负责等，或者去做别的事。"""
 
-    def __init__(self, ctx: TaskContext, arena: Arena, mode) -> None:
-        self.ctx, self.a, self.mode = ctx, arena, mode
+    def __init__(self, ctx: TaskContext, arena: Arena, opts: Mapping) -> None:
+        self.ctx, self.a, self.mode = ctx, arena, opts.get("mode") or SWEEP
+        self.target = target_rid(opts) if self.mode == TARGET else None  # 指定对手的 rid
+        self.target_name = ""
+        self.fallback = ""  # 指定对手打不了、改打榜首的原因（有它就不算完全成功）
+        self.me: Mapping | None = None  # begin 读到的自己（算功勋时的自己战力）
+        self.feats: list[tuple] = []  # 每场：(手打/扫荡, 得到功勋, 自己战力, 对手战力, 对手战功)
         self.swept = self.fought = self.total = 0  # total 在 begin 里算出；0 = 还没算到（没开始做）
         self.dead: set[int] = set()  # 不能扫的号位：客户端规则判出来的（见 sweepable）+ 服务器拒绝过的
         self.manual_why = ""  # 扫荡模式下改手打的原因，写进最终结果
@@ -247,8 +273,11 @@ class Job:
     def begin(self) -> None:
         """读状态、算次数。能直接得出结果（跳过/阻止）就设置 self.result。"""
         a, ctx = self.a, self.ctx
-        if self.mode not in (SWEEP, MANUAL, BOTTOM):
-            self.result = TaskResult(a.id, SKIPPED, "没有选择模式（在“选模式”里选榜首、榜尾或扫荡）")
+        if self.mode not in (SWEEP, MANUAL, BOTTOM, TARGET):
+            self.result = TaskResult(a.id, SKIPPED, "没有选择模式（在“选模式”里选榜首、榜尾、扫荡或指定）")
+            return
+        if self.mode == TARGET and self.target is None:
+            self.result = TaskResult(a.id, BLOCKED, f"{a.title}选了“指定”，但“选择”里没填全 UID 和角色编号，未挑战")
             return
         try:
             resp = api.arena_info(ctx.request, pet=a.pet)
@@ -261,11 +290,14 @@ class Job:
             self.result = TaskResult(a.id, BLOCKED, f"无法确认{a.title}免费挑战次数，未挑战：{quota_issue}")
         elif left <= 0:
             self.result = TaskResult(a.id, SKIPPED, f"{a.title}今日免费挑战次数已用完")
-        elif not recs:
+        elif self.mode == TARGET and self.target == str((state.section(resp, "self") or {}).get("rid") or ""):
+            self.result = TaskResult(a.id, BLOCKED, f"{a.title}指定的对手是自己（{self.target}），未挑战")
+        elif not recs and self.mode != TARGET:
             self.result = TaskResult(a.id, SKIPPED, f"{a.title}没有服务器给出的挑战目标")
         if self.result:
             return
         self.recs, self.total = recs, min(left, MAX_RUNS)
+        self.me = state.section(resp, "self")
         self._plan_sweep(resp)
         self.show()
 
@@ -307,12 +339,17 @@ class Job:
     def finish(self, stop: str = "") -> None:
         why = f"：{self.manual_why}" if self.manual_why and self.fought else ""
         text = f"{self.a.title}已挑战 {self.done}/{self.total} 次（扫荡 {self.swept}，手打 {self.fought}{why}）"
+        if self.target:
+            text += f"；指定对手 {self.target_name}（{self.target}）" if self.target_name else f"；指定对手 {self.target}"
+        text += self.feat_text()
+        if self.fallback:
+            text += f"；{self.fallback}"
         if stop == "已被用户停止":
             status = SUBMITTED if self.done else SKIPPED
         elif stop:
             status = BLOCKED
         else:
-            status = SUBMITTED if self.done else BLOCKED
+            status = SUBMITTED if self.done and not self.fallback else BLOCKED  # 改打了榜首：橙色，不显示绿色
         self.result = TaskResult(self.a.id, status, f"{text}；{stop}" if stop else text)
         self.ctx.report(self.result)  # 任务行马上显示最终状态，不等收尾
 
@@ -343,10 +380,30 @@ class Job:
                 row.update(_flat(ctx.request(a.details, {"targetId": tid})))
             if not _has_opponent(row):
                 raise p.AllianceError("服务器未返回对手 name/entityId，未创建挑战")
+            if self.target and str(tid) == self.target:  # 改打榜首后别把榜首的名字记成指定对手的
+                self.target_name = str(next((row[k] for k in _NAME_KEYS if row.get(k)), "") or "")
             ctx.request(a.begin, {})
-            ctx.request(a.end, {"targetId": tid, "win": 1})
+            self._feat(ctx.request(a.end, {"targetId": tid, "win": 1}), row, "手打")
         finally:
             self.last = time.monotonic()
+
+    def _feat(self, resp, row, how: str) -> None:
+        """记下这一场服务器给的功勋（响应顶层 battleScore，客户端结算画面就显示它）和当时双方战力、对手战功，
+        结束时写进日志，用来对出功勋的算法（Challenge.featsIndex 客户端没用到，算法在服务器）。"""
+        got = state.num(resp.get("battleScore")) if isinstance(resp, Mapping) else None
+        theirs = target_power(self.a, row)
+        if theirs is None and not self.a.pet:  # 竞技场详情里的战力在顶层（MissonCompleteCmd 显示的 fightPower）
+            theirs = _power(row.get("fightPower"))
+        self.feats.append((how, got, my_power(self.a, self.me), theirs, _power(row.get("totalScore"))))
+
+    def feat_text(self) -> str:
+        if not self.feats:
+            return ""
+        def n(x):
+            return "?" if x is None else str(int(x))
+        got = [g for _, g, *_ in self.feats if g is not None]
+        rows = "，".join(f"{how}+{n(g)}（我{n(mine)}/对手{n(theirs)}/对手战功{n(score)}）" for how, g, mine, theirs, score in self.feats)
+        return f"；功勋共 +{n(sum(got)) if got else '?'}：{rows}"
 
     def _sweep_once(self) -> None:
         a, ctx = self.a, self.ctx
@@ -366,6 +423,7 @@ class Job:
                 self.finish(f"扫荡失败：{exc}")
             return
         self.last = time.monotonic()
+        self._feat(r, self.recs[slot - 1], "扫荡")
         remaining = state.num(state.find(r, "sweepEnergy", depth=8))
         self.energy = remaining if remaining is not None else self.energy - SWEEP_COST
         self.swept += 1
@@ -379,6 +437,16 @@ class Job:
         return 8 if len(self.recs) >= 8 else (1 if self.a.pet else None)
 
     def _fight_once(self) -> None:
+        if self.target and not self.fallback:  # 指定对手：不看推荐列表，每次都打同一个人；打不了改打榜首
+            try:
+                self._fight({"rid": self.target})
+            except p.AllianceError as exc:
+                self.fallback = f"指定对手打不了（{exc}），剩下的改打榜首"
+                self.mode = MANUAL  # 接着往下走榜首（推荐列表在 begin 里读过；之后每次照常重读）
+            else:
+                self.fought += 1
+                self._counted()
+                return
         if not self.fresh:  # 上一次操作后对手已变，重读推荐后再挑
             try:
                 self.recs = targets(api.arena_info(self.ctx.request, pet=self.a.pet))
@@ -429,7 +497,7 @@ class Scheduler:
         self.spec = load_tasks()[ARENA.id if ARENA in arenas else a.id]  # 竞技场任务声明的路由含斗宠的，穿插时按它放行
         self.deferred = False  # 经过前置步骤 = 手打穿插在后续任务里；否则（单独运行）run 里打完
         self.busy = False
-        self.jobs = {x.id: Job(ctx, x, (ctx.options if x is a else ctx.all_options.get(x.id) or {}).get("mode") or SWEEP) for x in arenas}
+        self.jobs = {x.id: Job(ctx, x, ctx.options if x is a else ctx.all_options.get(x.id) or {}) for x in arenas}
         with self.bound():
             for job in self.jobs.values():
                 job.begin()

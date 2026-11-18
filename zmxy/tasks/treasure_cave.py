@@ -4,6 +4,9 @@
 共享宝箱的 dungeonTreasure 不是挑战次数）。读不到或表里上限不唯一 → 不挑战。
 战斗本身不做：``beginBattle {entityId}`` 之后直接 ``endBattle {entityId, win:1}``，与客户端提交的字段一致。
 任何一步失败都不重发；``beginBattleWithTicket`` 等点券路由没有声明，也会被守卫拒绝。
+模式（行上切换，2026-11-14 用户要求，和竞技场一样）：推荐 = 上面的做法；指定 = 每次都打“选择”里填的那个人的洞府
+（UID + 角色编号 → ``getPublishLandform {rid}`` 查对方已发布的洞，几个里取星级 ``defensiveLevel`` 最高的，``entityId`` 即游戏里的挑战码），
+同样算次数、有奖励（用户确认 Tips 307“不消耗次数、无奖励”是旧说法）。对方没发布 / 查不到 / 打不了 → 剩下的改打推荐，结果记“已阻止”（橙色）。
 挑战之后顺带领取已发布藏宝洞满一小时的仙魄（``getPublishLandform {rid}`` → 逐洞 ``getReward {entityId}``；2026-11-08 从妖幡卷商店挪过来）。
 次数用完、读不到次数也照样去领；挑战结果未知时不领。
 """
@@ -15,6 +18,7 @@ import time
 
 from .. import daycut, dungeon, protocol as p, state
 from ..core import BLOCKED, SKIPPED, SUBMITTED, TaskContext, TaskResult, UncertainOutcome, task
+from .arena import target_rid
 
 ID = "treasure_cave"
 R_RECOMMEND = "scene.cardHandler.getRecommend"
@@ -23,6 +27,13 @@ R_END = "scene.cardHandler.endBattle"
 R_PUBLISHED = "scene.cardHandler.getPublishLandform"
 R_REWARD = "scene.cardHandler.getReward"
 MAX_RUNS = 50
+TARGET, RECOMMEND = "target", "recommend"
+MODES = ((TARGET, "指定"), (RECOMMEND, "推荐"))
+MODE_NOTE = ("推荐：每次打服务器推荐的三个洞府里中间那个。\n"
+             "指定：每次都打“选择”里填的那个人的洞府（发布了几个就打星级最高的）；打不了就改打推荐，结果显示成已阻止（橙色）。")
+TARGET_NOTE = ("角色编号 = 对方账号里第几个创建的角色，从 0 数起，删掉的也算，和存档在第几格无关。\n"
+               "不知道编号：先空着点“预览”，会查对方现在用的角色，并把编号自动填上。\n"
+               "对方要发布了洞府才打得了；打不了（没发布、服务器不让打）就改打推荐，结果显示成已阻止（橙色）。")
 
 
 def daily_cap() -> int | None:
@@ -43,7 +54,8 @@ def recommendations(response) -> list | None:
     return None
 
 
-@task(ID, "藏宝洞", reads={R_RECOMMEND, R_PUBLISHED}, writes={R_BEGIN, R_END, R_REWARD})
+@task(ID, "藏宝洞", reads={R_RECOMMEND, R_PUBLISHED}, writes={R_BEGIN, R_END, R_REWARD},
+      modes=MODES, mode_default=RECOMMEND, mode_note=MODE_NOTE)
 def run(ctx: TaskContext) -> TaskResult:
     cave = challenge(ctx)
     try:
@@ -55,7 +67,23 @@ def run(ctx: TaskContext) -> TaskResult:
     return TaskResult(ID, status, f"{cave.detail}；{fairy.detail}")
 
 
+def target_cave(ctx: TaskContext, rid: str) -> tuple[str, str]:
+    """对方已发布洞府里星级最高的那个：(entityId, 主人名字)。没发布 / 数据不对 → AllianceError（改打推荐）。"""
+    rows = ctx.request(R_PUBLISHED, {"rid": rid}).get("data")
+    rows = [r for r in rows if isinstance(r, Mapping) and isinstance(r.get("entityId"), str) and r["entityId"]] if isinstance(rows, list) else []
+    if not rows:
+        raise p.AllianceError("对方没有发布洞府")
+    best = max(rows, key=lambda r: state.num(state.find(r, "defensiveLevel", depth=3)) or 0)
+    return best["entityId"], str(state.find(best, "username", depth=3) or "")
+
+
 def challenge(ctx: TaskContext) -> TaskResult:
+    mode = ctx.options.get("mode") or RECOMMEND
+    target = target_rid(ctx.options) if mode == TARGET else None
+    if mode == TARGET and target is None:
+        return TaskResult(ID, BLOCKED, "藏宝洞选了“指定”，但“选择”里没填全 UID 和角色编号，未挑战")
+    if target and target == ctx.session.record_id:
+        return TaskResult(ID, BLOCKED, f"藏宝洞指定的是自己（{target}），未挑战")
     cap, used = daily_cap(), state.used(ctx.info, "landformChallengeCnt")
     if cap is None or used is None:
         return TaskResult(ID, BLOCKED, "无法确认藏宝洞免费次数（缺少 cardChallengeMaxNum 或 landformChallengeCnt），未挑战")
@@ -65,35 +93,59 @@ def challenge(ctx: TaskContext) -> TaskResult:
         return TaskResult(ID, SKIPPED, f"藏宝洞今日免费次数已用完（上限 {cap}）")
     gains, done = dungeon.Gains(), 0
     total = min(left, MAX_RUNS)
+    picked = {"target": target, "name": "", "fallback": ""}  # 指定洞府：对方 rid、主人名字、改打推荐的原因
+
+    def end(status: str, why: str) -> TaskResult:
+        return _end(done, gains, status, why, picked)
     try:
         for _ in range(total):
             if ctx.stopped:
                 break
             if why := daycut.reason(ctx.session):
-                return _end(done, gains, SUBMITTED if done else SKIPPED, why)
+                return end(SUBMITTED if done else SKIPPED, why)
             if done == 0:
                 ctx.log(f"藏宝洞 {done}/{total}")
+            if target and not picked["fallback"]:
+                try:
+                    entity, picked["name"] = target_cave(ctx, target)
+                    spent[("cave",)] += 1  # 先占用：开始战斗后的任何失败都可能已消耗次数
+                    gains.add([ctx.request(R_BEGIN, {"entityId": entity}), ctx.request(R_END, {"entityId": entity, "win": 1})],
+                              ctx.session.drain_pushes())
+                except p.AllianceError as exc:
+                    picked["fallback"] = f"指定洞府打不了（{exc}），剩下的改打推荐"
+                    left = cap - used - spent[("cave",)]
+                    if left <= 0:
+                        break
+                else:
+                    done += 1
+                    ctx.log(f"藏宝洞 {done}/{total}")
+                    continue
             try:
                 options = recommendations(ctx.request(R_RECOMMEND))
                 if options is None:
-                    return _end(done, gains, BLOCKED, "服务器未返回三项推荐，未开始战斗")
+                    return end(BLOCKED, "服务器未返回三项推荐，未开始战斗")
                 entity = state.find(options[1], "entityId", "entity_id", depth=5)
                 if entity in (None, ""):
-                    return _end(done, gains, BLOCKED, "中间推荐缺少 entityId，未开始战斗")
+                    return end(BLOCKED, "中间推荐缺少 entityId，未开始战斗")
                 spent[("cave",)] += 1  # 先占用：开始战斗后的任何失败都可能已消耗次数
                 gains.add([ctx.request(R_BEGIN, {"entityId": entity}), ctx.request(R_END, {"entityId": entity, "win": 1})],
                           ctx.session.drain_pushes())
             except p.AllianceError as exc:
-                return _end(done, gains, BLOCKED, f"第 {done + 1} 次未完成：{exc}")
+                return end(BLOCKED, f"第 {done + 1} 次未完成：{exc}")
             done += 1
             ctx.log(f"藏宝洞 {done}/{total}")
     except UncertainOutcome as exc:
         raise UncertainOutcome(f"藏宝洞已完成 {done} 次；{exc}") from exc
-    return _end(done, gains, SUBMITTED if done else SKIPPED, "已被用户停止" if ctx.stopped else "")
+    status = BLOCKED if picked["fallback"] else SUBMITTED if done else SKIPPED  # 改打了推荐：橙色，不显示绿色
+    return end(status, "已被用户停止" if ctx.stopped else "")
 
 
-def _end(done: int, gains: dungeon.Gains, status: str, why: str) -> TaskResult:
+def _end(done: int, gains: dungeon.Gains, status: str, why: str, picked: Mapping | None = None) -> TaskResult:
     text = f"藏宝洞挑战 {done} 次"
+    if picked and picked["target"]:
+        text += f"；指定洞府 {picked['name']}（{picked['target']}）" if picked["name"] else f"；指定洞府 {picked['target']}"
+        if picked["fallback"]:
+            text += f"；{picked['fallback']}"
     if gains.items:
         text += f"；获得 {gains.text()}"
     if why:

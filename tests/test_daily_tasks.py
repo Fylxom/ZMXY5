@@ -439,7 +439,7 @@ class RegistryTests(unittest.TestCase):
                                "black_market", "pet_elf", "shanfa_like", "monster_card", "wish_pool", "fairy_feed", "union_warehouse",
                                "arena", "pet_arena", "treasure_cave", "quick_develop", "pet_trial", "daily_quest",
                                "nine_tower", "ten_yama", "forest", "wanxiang_tree", "tree_king", "free_maze", "refine",
-                               "teacher_teach", "teacher_learn", "alliance", "vip_gift", "month_card", "group_signin"])
+                               "teacher_teach", "teacher_learn", "alliance", "vip_gift", "month_card", "pet_brawl_pve", "group_signin"])
 
     def test_weekly_page_tasks(self):
         weekly = [i for i, spec in load_tasks().items() if spec.group == "周常"]

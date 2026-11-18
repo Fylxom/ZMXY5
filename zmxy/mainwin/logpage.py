@@ -60,8 +60,8 @@ class LogPageMixin:
         self.detail.hide()
         self.detail_gap.hide()
 
-    def _add_log(self, acc: str, task: str, status: str, detail: str) -> None:
-        self.table.add((time.strftime("%H:%M:%S"), acc, task, status, detail))
+    def _add_log(self, acc: str, task: str, status: str, detail: str, everywhere: bool = False) -> None:
+        self.table.add((time.strftime("%H:%M:%S"), acc, task, status, detail), everywhere)
 
     def _show_detail(self, row: tuple | None) -> None:
         self.detail.setVisible(row is not None)
@@ -78,10 +78,12 @@ class LogPageMixin:
         """UID 结果交给专用弹窗，主窗口不再按原始字段创建页签。"""
         from ..uid.ui import UidProfileDialog
 
-        payload = popup.get("payload")
+        from ..uid.sheet import Sheet
+
+        data = popup.get("sheet")
         title = str(popup.get("title") or "UID资料查询结果")
-        if isinstance(payload, Mapping) and "pages" in payload:
-            UidProfileDialog(self, payload, title).run()
+        if isinstance(data, Sheet):
+            UidProfileDialog(self, data, title).run()
             return
         text = popup.get("text")
         if not isinstance(text, str) or not text:

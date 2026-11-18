@@ -184,6 +184,7 @@ class AccountsMixin:
         self._load_tidy(sv)
         self._load_pet_filter(sv)
         self._load_pet_harvest(sv)
+        self._load_uid(sv)
         self._load_counts(acc, sv)
         self._load_modes(acc, sv)
         self.refresh_summaries()

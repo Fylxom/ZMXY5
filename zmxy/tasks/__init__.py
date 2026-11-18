@@ -19,9 +19,9 @@ from .events import game_high_jump  # noqa: F401
 from . import (  # noqa: F401
     chapter_role, login_gift, limited_quest, dragon_treasure, ancient, demon_tower, last_rewards,
     tree_king_nightmare, star_maze, time_boat, limited_shop, tongtian, tongtian_escort, ten_jue,
-    teacher_trial, pet_brawl, pvp_match, pet_catch,
+    teacher_trial, pet_brawl, pet_brawl_pve, pvp_match, pet_catch,
 )
 from .pet_cultivation import task  # noqa: F401
 from . import (  # noqa: F401
-    arena_apply, garden, boss_raid, uid_lookup, group_signin,
+    arena_apply, garden, union_boss, boss_raid, uid_lookup, group_signin,
 )

@@ -85,6 +85,7 @@ class LogTable(QWidget):
         self._next = 0  # 下一个排序号
         self.on_accounts: Callable[[list[str]], None] | None = None  # 出现新账号名时通知筛选框
         self.accounts: list[str] = []
+        self.everywhere: set[int] = set()  # 属于部分账号、但“全部账号”页也要显示的系统行（rows 下标）：第一个账号开始、最后一个结束
         self.rh = 34
         self.f = font(10)
         self.xs, x = [], 12
@@ -220,13 +221,22 @@ class LogTable(QWidget):
     def base(cls, acc: str) -> str:  # 日志里的名字 -> 账号（去掉存档部分）
         return acc.split(cls.SEP)[0]
 
+    JOIN = "、"  # 系统行（执行开始、结束）属于几个账号时：账号1、账号9
+
+    @classmethod
+    def owners(cls, acc: str) -> list[str]:  # 这一行属于哪些账号；“—”、空 = 不属于哪个账号
+        return [] if acc in ("", "—") else cls.base(acc).split(cls.JOIN)
+
     def shown_name(self, acc: str) -> str:  # 只看单个账号时，账号列只写“存档 n”
         return acc.split(self.SEP, 1)[1] if self.filter is not None and self.base(acc) == self.filter and self.SEP in acc else acc
 
-    def _shown(self, row: tuple[str, str, str, str, str]) -> bool:
+    def _shown(self, i: int) -> bool:
+        row = self.rows[i]
         if row[2] == "数据更新":
             return self.filter is None
-        return self.filter is None or row[1] == "—" or self.base(row[1]) == self.filter
+        if self.filter is None:  # 全部账号：中途某个账号自己的开始、结束不显示（到它的账号下看），整体的第一个开始、最后一个结束显示
+            return row[2] != "系统" or not self.owners(row[1]) or i in self.everywhere
+        return row[1] == "—" or self.filter in self.owners(row[1])
 
     @property
     def view(self) -> list[int]:
@@ -234,7 +244,7 @@ class LogTable(QWidget):
         if self._stale:
             self._stale = False
             pinned = {i: self.PINNED.index(key[1]) for key, i in self.live.items() if key[1] in self.PINNED}  # 下标 -> 固定行内的先后
-            self._view = sorted((i for i, r in enumerate(self.rows) if self._shown(r)), key=lambda i: (i in pinned, pinned.get(i, 0), self.order[i]))
+            self._view = sorted((i for i in range(len(self.rows)) if self._shown(i)), key=lambda i: (i in pinned, pinned.get(i, 0), self.order[i]))
         return self._view
 
     def _rebuild_view(self) -> None:
@@ -249,18 +259,22 @@ class LogTable(QWidget):
             self.redraw()
         self._bottom()
 
-    def add(self, row: tuple[str, str, str, str, str]) -> None:
-        if row[1] not in ("", "—") and self.base(row[1]) not in self.accounts:
-            self.accounts.append(self.base(row[1]))
+    def add(self, row: tuple[str, str, str, str, str], everywhere: bool = False) -> None:
+        """everywhere：属于部分账号的系统行在“全部账号”页也显示。"""
+        new = [n for n in self.owners(row[1]) if n not in self.accounts]
+        if new:
+            self.accounts.extend(new)
             if self.on_accounts:
                 self.on_accounts(self.accounts)
         self.rows.append(row)
+        if everywhere:
+            self.everywhere.add(len(self.rows) - 1)
         self.trails.append([])
         self.order.append(self._next)
         self._next += 1
         if self._stale or any(key[1] in self.PINNED for key in self.live):  # 有固定在底部的行：新行要插到它们前面
             self._rebuild_view()
-        elif self._shown(row):  # 普通情况：新行就是最后一行，不用重排
+        elif self._shown(len(self.rows) - 1):  # 普通情况：新行就是最后一行，不用重排
             self._view.append(len(self.rows) - 1)
         self.redraw()
         self._bottom()
@@ -331,6 +345,7 @@ class LogTable(QWidget):
         self._stale, self._next = False, 0
         self.live.clear()
         self.done.clear()
+        self.everywhere.clear()
         self.trails.clear()
         self.accounts.clear()
         if self.on_accounts:

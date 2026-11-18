@@ -1,6 +1,5 @@
-"""联盟 Boss / 世界 Boss（周常页“Boss”模块，单独执行）。都是“进场 → 定时上报伤害 → 等结算推送 → 退出”，没有本地战斗。
+"""世界 Boss（祖巫，周常页）：“进场 → 定时上报伤害 → 等结算推送 → 退出”，没有本地战斗。联盟 Boss 在 ``union_boss``。
 
-* 联盟 Boss：``challengeBoss`` 进场，每秒 ``attackBossCopy {hurt}``（每分钟约 0.2% 最大血量），结算 ``onFinishLeagueBossCopy`` 后 ``exitLeagueCopy``。
 * 世界 Boss（祖巫）。排名奖励：伤害占比 ≥ 5% 且在自己的榜（战力 ≥ ``highPower`` 进高战榜，否则普通榜）前三；前三奖励一样，只求稳进前三。
   1. 选房：没满员、血量过半的房间里人最少的；一个祖巫试 ``ROUND`` 个都争不到就换下一个祖巫，都没有再等重开的新房间（最多 ``WAIT_ROOMS`` 秒）。
   2. 对手 = 同榜占比到 ``QUIT_SHARE``% 的人，占比估到 Boss 死的时候。要保持在“第 3 高的 + ``LEAD``”以上；战力比我高的对手有 3 个就退出换房间。
@@ -26,11 +25,7 @@ from . import boss_rules as r
 from .boss_fight import recount, world_fight
 from .boss_room import Room
 
-UNION_ID, WORLD_ID = "union_boss", "world_boss"
-R_UNION_ENTER = "league.leagueHandler.challengeBoss"
-R_UNION_HIT = "scene.leagueHandler.attackBossCopy"
-R_UNION_EXIT = "scene.leagueHandler.exitLeagueCopy"
-PERCENT_PER_MINUTE = 0.2     # 联盟 Boss：每分钟伤害占最大血量的百分比
+WORLD_ID = "world_boss"
 PROFILE_KEY = "role_level"   # 账号 profile 里的角色等级：选择框据此过滤祖巫
 HEALTHY = 0.5                # 选房：血量比例 ≥ 这个值才进
 ROUND = 3                    # 一个祖巫先在现有房间里试这么多个
@@ -42,7 +37,6 @@ BETWEEN = (6.0, 12.0)        # 打完一场到进下一场隔几秒
 GOLD = 4                     # FormationFlag.quality：4 = 传说
 RESERVE_WEEK = 4  # 次数留给翅膀光环养成周（state.GROWTH_WEEKS 的序号）；定时开着“按养成周”时选项里带 plan="growth"
 MAX_FIGHTS = 9               # 行上“次数”的上限，也是没填过时的初始值（= 有几次打几次）
-P_UNION_HIT, P_UNION_HP, P_UNION_FINISH = "onBossCopySelfHit", "onLeagueBossHpChange", "onFinishLeagueBossCopy"
 
 
 def world_bosses() -> list[tuple[int, str]]:
@@ -66,11 +60,6 @@ def available(boss_id: int, profile: Mapping[str, Any]) -> bool:
     """选择对话框里是否显示该祖巫：读到过角色等级就按等级过滤；没读到放行（由进场时再判）。"""
     level, need = state.num(profile.get(PROFILE_KEY)), boss_level(boss_id)
     return level is None or need is None or level >= need
-
-
-def union_hurt(hp_max: float) -> float:
-    rate = hp_max * PERCENT_PER_MINUTE / 100 / 60
-    return random.uniform(rate / 4, rate * 7 / 4)
 
 
 def _my_card(request: Callable[[str, dict], Any], uid: int | None) -> dict:
@@ -160,89 +149,11 @@ def _obj(response: Any) -> Mapping[str, Any]:
     return response
 
 
-def _union_fight(ctx: TaskContext, hp_max: float, start_ms: float, end_ms: float) -> tuple[bool, str]:
-    """联盟 Boss 进场后的上报循环；返回 (是否收到结算推送, 说明)。退出副本由调用方负责。"""
-    now = servertime.now()  # end_ms / start_ms 是服务器时间
-    left = end_ms / 1000 - now if end_ms else 0
-    deadline = time.monotonic() + (left + r.GRACE_SECONDS if left > 0 else r.FALLBACK_SECONDS)
-    wait_start = start_ms / 1000 - now if start_ms else 0
-    if wait_start > 0:
-        ctx.log(f"联盟Boss：等待开战约 {wait_start:.0f} 秒")
-        if not ctx.sleep(min(wait_start, deadline - time.monotonic()), background=False):
-            return False, "已被用户停止"
-    hit, hp, sent, finished = 0.0, None, 0, None
-
-    def absorb() -> None:
-        nonlocal hit, hp, finished
-        for route, body in ctx.session.drain_routed():
-            if not isinstance(body, Mapping):
-                continue
-            if route == P_UNION_HIT and body.get("hit") is not None:
-                hit = state.num(body["hit"]) or hit
-            elif route == P_UNION_HP and body.get("hp") is not None:
-                hp = state.num(body["hp"])
-            elif route == P_UNION_FINISH:
-                finished = body
-
-    while finished is None and time.monotonic() < deadline:
-        if ctx.stopped:
-            return False, "已被用户停止"
-        if hp is not None and hp <= 0:  # Boss 已倒：不再上报，等结算推送
-            try:
-                finished = ctx.wait_push(P_UNION_FINISH, max(1.0, deadline - time.monotonic()))
-            except p.AllianceError:
-                break
-            continue
-        try:
-            ctx.request(R_UNION_HIT, {"hurt": union_hurt(hp_max)})
-        except p.AllianceError as exc:
-            absorb()
-            if finished is None:
-                return False, f"伤害上报停止：{exc}"
-            break
-        sent += 1
-        absorb()
-        if sent % 10 == 0:
-            ctx.log(f"联盟Boss：已上报 {sent} 次，服务器计伤 {hit:,.0f}（{hit / hp_max:.2%}）")
-        if finished is None and not ctx.sleep(1, background=False):
-            return False, "已被用户停止"
-    if finished is None:  # 时间到了还没收到结算：再等一小会儿
-        try:
-            finished = ctx.wait_push(P_UNION_FINISH, 10)
-        except p.AllianceError:
-            pass
-    note = f"上报 {sent} 次，服务器计伤 {hit:,.0f}（{hit / hp_max:.2%}）"
-    if finished is None:
-        return False, f"{note}；等待结算推送超时"
-    return True, f"{note}；已结算" + ("（击败）" if isinstance(finished, Mapping) and finished.get("success") else "")
-
-
 def _exit(ctx: TaskContext, route: str) -> None:
     try:
         ctx.request(route, {})
     except p.AllianceError:  # 服务器明确拒绝退出，不覆盖本场已经确定的结果
         pass
-
-
-@task(UNION_ID, "联盟Boss", writes={R_UNION_ENTER, R_UNION_HIT, R_UNION_EXIT}, group="周常")
-def union_boss(ctx: TaskContext) -> TaskResult:
-    league = ctx.info.get("league")
-    if not isinstance(league, Mapping) or not league.get("leagueId"):
-        return TaskResult(UNION_ID, SKIPPED, "当前存档未加入联盟")
-    try:
-        entered = _obj(ctx.request(R_UNION_ENTER, {"pNum": 0}))
-    except p.AllianceError as exc:
-        return TaskResult(UNION_ID, BLOCKED, f"进入联盟 Boss 失败：{exc}")
-    try:
-        boss = entered.get("Boss") or entered.get("boss")
-        hp_max = state.num(boss.get("hpMax")) if isinstance(boss, Mapping) else None
-        if not hp_max or hp_max <= 0:
-            return TaskResult(UNION_ID, BLOCKED, "服务器没有返回 Boss 最大血量，未上报伤害")
-        ctx.engage(True)
-        done, note = _union_fight(ctx, hp_max, state.num(entered.get("startTime")) or 0, state.num(entered.get("endTime")) or 0)
-    finally:
-        _exit(ctx, R_UNION_EXIT)
-    return TaskResult(UNION_ID, SUBMITTED if done else BLOCKED, note)
 
 
 def _chances(info: Mapping[str, Any]) -> int | None:

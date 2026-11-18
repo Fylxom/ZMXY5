@@ -37,12 +37,11 @@ class Raid(Fake):
 
     def request(self, route, body):
         out = super().request(route, body)
-        if route in (b.R_UNION_HIT, boss_rules.R_WORLD_HIT):
+        if route == boss_rules.R_WORLD_HIT:
             self.hits += 1
             self.total += body["hurt"]
-            world = route == boss_rules.R_WORLD_HIT
-            world and self.times.append(self.now())
-            self.queue.append(SimpleNamespace(route=boss_rules.P_SELF if world else "onBossCopySelfHit", body={"hit": self.total if world else self.hits * 10.0}))
+            self.times.append(self.now())
+            self.queue.append(SimpleNamespace(route=boss_rules.P_SELF, body={"hit": self.total}))
             if self.board is not None:
                 self.queue.append(SimpleNamespace(route=boss_rules.P_RANK, body=self.board(self.total)))
             if self.finish_after and self.hits >= self.finish_after:
@@ -94,29 +93,6 @@ class BossRaidTests(unittest.TestCase):
         for patch in (mock.patch("zmxy.core.TaskContext.sleep", sleep), mock.patch.object(b.time, "monotonic", lambda: self.clock)):
             patch.start()
             self.addCleanup(patch.stop)
-
-    def union(self, info, response=None, finish_after=3):
-        response = response or {"code": 200, "Boss": {"hpMax": 1.0e9}, "endTime": (time.time() + 600) * 1000}
-        conn = Raid(lambda r, bd: response if r == b.R_UNION_ENTER else None, finish_after, "onFinishLeagueBossCopy")
-        return conn, run("union_boss", conn, info, {})
-
-    def test_union_needs_a_league(self):
-        conn, res = self.union({})
-        self.assertEqual(res.status, "skipped")
-        self.assertEqual(conn.sent, [])
-
-    def test_union_reports_until_finish_then_exits(self):
-        conn, res = self.union({"league": {"leagueId": 1}})
-        self.assertEqual(res.status, "submitted", res.detail)
-        self.assertEqual(conn.routes(), ["challengeBoss", "attackBossCopy", "attackBossCopy", "attackBossCopy", "exitLeagueCopy"])
-        hurts = [bd["hurt"] for r, bd in conn.sent if r == b.R_UNION_HIT]
-        rate = 1.0e9 * 0.2 / 100 / 60
-        self.assertTrue(all(rate / 4 <= h <= rate * 7 / 4 for h in hurts))
-
-    def test_union_without_boss_hp_does_not_report_but_still_exits(self):
-        conn, res = self.union({"league": {"leagueId": 1}}, {"code": 200, "Boss": {}})
-        self.assertEqual(res.status, "blocked")
-        self.assertEqual(conn.routes(), ["challengeBoss", "exitLeagueCopy"])
 
     # ---------------------------------------------------------------- 世界 Boss
     ROOMS = [{"roomId": "a", "userCnt": 6, "boss": {"hp": HP, "hpMax": HP}}, {"roomId": "b", "userCnt": 2, "boss": {"hp": HP * 0.7, "hpMax": HP}},

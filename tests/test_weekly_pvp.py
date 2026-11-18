@@ -853,6 +853,28 @@ class PetBrawlTests(unittest.TestCase):
         self.assertIn("打了 1 场，今日乱斗币 20/20", r.detail)
         self.assertNotIn("重开", r.detail)
 
+    ABNORMAL = [("onPrepareCreateOnlineCopy", {"dungeonId": 2000101, "roomId": "0$1"}),
+                ("onPetPVPFinish", {"winType": 2, "reportId": "petPvp-offline", "addScore": 0, "addPetBtlM": 0,
+                                    "give": [], "error": "对方已逃跑"})]  # 真机 11-17：结算战斗异常（第 1 局双方报输判平、对方逃跑），乱斗币+0
+
+    def test_abnormal_finish_without_coins_is_replayed(self):
+        conn, r = self.fled_run(self.ABNORMAL + self.WON, 1)
+        self.assertEqual(r.status, "submitted", r.detail)
+        self.assertEqual(conn.routes().count("matchStart"), 2)
+        self.assertIn("打了 1 场，今日乱斗币 20/20", r.detail)
+        self.assertIn("战斗异常没给币", r.detail)
+
+    def test_abnormal_finish_that_paid_coins_counts(self):
+        conn, r = self.fled_run(self.ABNORMAL, 1, after=self.CAP)
+        self.assertEqual(conn.routes().count("matchStart"), 1)
+        self.assertIn("打了 1 场，今日乱斗币 20/20", r.detail)
+
+    def test_abnormal_finish_replays_are_limited(self):
+        conn, r = self.fled_run(self.ABNORMAL * (pet_brawl.REPLAY_MAX + 2), 1)
+        self.assertEqual(r.status, "blocked", r.detail)
+        self.assertEqual(conn.routes().count("matchStart"), pet_brawl.REPLAY_MAX + 1)
+        self.assertIn("不再重开", r.detail)
+
     def test_replays_are_limited(self):
         conn, r = self.fled_run(self.FLED * (pet_brawl.REPLAY_MAX + 2), 1)
         self.assertEqual(r.status, "blocked", r.detail)

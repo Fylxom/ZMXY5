@@ -7,9 +7,10 @@ from typing import Any
 from PySide6.QtWidgets import QWidget
 
 from .. import core
-from ..dialogs import ChoiceDialog, FestivalDialog, RefineDialog, SaveDialog
+from ..dog_pool_dialog import DogPoolDialog, summary as dog_summary
+from ..dialogs import ChoiceDialog, FestivalDialog, RefineDialog, SaveDialog, TargetDialog
 from ..store import WEEKLY_WIDE
-from ..tasks import boss_raid, pet_catch, refine
+from ..tasks import arena, boss_raid, pet_catch, refine, target_preview, treasure_cave, union_boss
 from ..widgets import ACCENT, TEXT, WARN, set_fg
 from .running import read_error
 
@@ -76,8 +77,11 @@ class ChoicesMixin:
         self.refresh_boat()
         self.refresh_reward()  # 上届奖励的领取状态也是每个存档各自的
         self._refresh_refine(acc, sv)
+        if hasattr(self, "dog_lbl"):
+            self.dog_lbl.setText(dog_summary(self.store))
         for tid, lbl in self.summaries.items():
             lbl.setText(self._summary(tid, acc, sv))
+        self.refresh_targets()
 
     def _wide_summary(self, tid: str, acc: dict[str, Any]) -> str:
         if not acc:
@@ -98,6 +102,8 @@ class ChoicesMixin:
         opt = self._task_opts(acc, sv, tid)
         if tid == "festival":
             return festival_summary(opt)
+        if tid == union_boss.ID:
+            return union_boss.summary(opt)
         if ch.items is None:
             return picks_summary(ch, opt, sv)
         names = self._names.get(tid)
@@ -140,6 +146,13 @@ class ChoicesMixin:
         if dlg.saved:
             self.refresh_summaries()
 
+    def open_dog_pool(self) -> None:
+        dlg = DogPoolDialog(self, self.store)
+        dlg.run()
+        if dlg.saved:
+            self.store.save()
+            self.refresh_summaries()
+
     def save_count(self, spec: core.TaskSpec) -> None:
         """行上次数输入框：0–上限的整数存下来（0 和留空都是不执行），其他输入先不动。"""
         if self.current is None or self._loading_counts:
@@ -164,6 +177,29 @@ class ChoicesMixin:
         cfg = self._opts_cfg(spec.id)
         cfg.setdefault("options", {}).setdefault(spec.id, {})["mode"] = self.mode_vars[spec.id].get()
         self.store.save()
+        self.refresh_targets()
+
+    def refresh_targets(self) -> None:
+        """竞技场 / 斗宠：模式是“指定”才显示对手摘要和“对手”按钮。"""
+        acc = self._acc() or {}
+        sv = self.store.save_view(acc, self.slot) if acc else {}
+        for tid, (box, lbl) in self.foe_rows.items():
+            box.setVisible(tid in self.mode_vars and self.mode_vars[tid].get() == arena.TARGET)
+            lbl.setText(arena.target_summary(self._task_opts(acc or None, sv, tid)))
+
+    def choose_target(self, spec: core.TaskSpec) -> None:
+        if not self._require_account():
+            return
+        cfg = self._opts_cfg(spec.id)
+        opts = cfg.setdefault("options", {}).setdefault(spec.id, {})
+        note = treasure_cave.TARGET_NOTE if spec.id == treasure_cave.ID else arena.TARGET_NOTE
+        dlg = TargetDialog(self, spec.title, self.slot, opts, note,
+                           preview=lambda d, uid, role, s=spec: self.preview_target(s, d, uid, role))
+        dlg.run()
+        if dlg.saved:
+            opts.update(target_uid=dlg.uid, target_role=dlg.role)
+            self.store.save()
+            self.refresh_targets()
 
     def save_tasks(self) -> None:
         if self.current is None:
@@ -192,6 +228,37 @@ class ChoicesMixin:
         chip.set(not chip.on)
         self.store.save_cfg(self._acc(), self.slot)["no_pickup"] = [k for k, c in self.pickup_chips.items() if c.on]
         self.store.save()
+
+    def preview_target(self, spec: core.TaskSpec, dlg: TargetDialog, uid: int, role: int | None) -> None:
+        """“选择”对话框里的“预览”：用当前存档登录，只读查填的这个人（target_preview），结果写回对话框。占着这个账号直到查完。"""
+        acc = self._acc()
+        if acc is None:
+            dlg.show_preview("请先选择账号", done=True)
+            return
+        if self._busy():
+            dlg.show_preview("这个账号正在执行，等它结束再预览", done=True)
+            return
+        try:
+            account = self.store.to_account(acc, self._cookie_saver(acc), self.slot)
+        except Exception as exc:
+            dlg.show_preview(f"账号配置错误：{exc}", done=True)
+            return
+
+        def work() -> None:
+            try:
+                with core.login_lock(account.config.username), core.Session(account.config, on_cookie=account.on_cookie) as session:
+                    session.bind(target_preview.SPEC)
+                    text, found = target_preview.preview(session.request, spec.id, uid, role)
+            except Exception as exc:
+                text, found = f"预览失败：{read_error(exc)}", None
+            self.events.put(("target_preview", (dlg, text, found)))
+
+        self._spawn(work, {acc.get("username", "")})
+
+    def _on_target_preview(self, data: tuple) -> None:
+        dlg, text, found = data
+        if dlg.isVisible():  # 对话框关了就不写
+            dlg.show_preview(text, done=True, role=found)
 
     def boss_guess(self, dlg: ChoiceDialog) -> None:
         """世界Boss 选择框里的“估伤”：登录选定的存档，只读战力和装备，估低档 / 高档每分钟打掉每个祖巫百分之几，写在框里各祖巫的名字下面（不弹框、不进房间）。"""

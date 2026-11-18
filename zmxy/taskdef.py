@@ -200,7 +200,7 @@ DISPLAY_ORDER = (
     "pet_elf", "monster_card",              # 没有任何选项的在上面：3 字
     "wish_pool", "treasure_cave",
     "free_maze", "pet_collection",          # 4 字
-    "pet_trial",
+    "pet_trial", "pet_brawl_pve",
     "mystery_shop", "fairy_trial",
     "black_market",
     "growth_road", "quick_develop",         # 有选项的在下面：先是行上切换

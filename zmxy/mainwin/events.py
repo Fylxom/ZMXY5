@@ -139,7 +139,11 @@ class EventsMixin:
             self.jobs.remove(job)
         if job.stop is not None:
             self._flush_todos(job)
-            self._add_log("—", "系统", "info", "结束")
+            if core.stopping(job.stop):  # 中途停止：“停止”行在全部账号页也显示，写明是哪个账号
+                self._add_log(self._owner(job.users), "停止", "info", "已中途停止，执行结束")
+            else:
+                last = not any(j.stop is not None for j in self.jobs)  # 最后一个在执行的也结束了：“全部账号”页也显示
+                self._add_log(self._owner(job.users), "系统", "info", "结束", everywhere=last)
         if job.timed:
             self.timed_names -= job.timed
             for name in job.timed:

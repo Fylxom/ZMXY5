@@ -186,6 +186,13 @@ class _AccountRun:
 
         activity.enter(ident, spec.id, self.stop)
         try:
+            if getattr(session, "dropped", False) is True:  # 前一个任务里请求超时 / 网络断开，连接被关掉了：先重新登录，别让后面的任务都拿断了的连接失败
+                self.emit(self.name, TaskResult(spec.id, PROGRESS, "主连接已断开（上一个请求超时或网络断开），重新登录后接着做"))
+                try:
+                    session.relogin()
+                except Exception as exc:  # 网络还没恢复等：暂停，联网后点“继续”从这个任务接着做
+                    why = login.explain(exc) if isinstance(exc, p.AllianceError) else f"{type(exc).__name__}: {exc}"
+                    return ended(PAUSED, f"主连接断开后重新登录失败：{why}"), True
             ctx = TaskContext(
                 session, owner.options.get(spec.id, {}), stop=self.stop, no_pickup=owner.no_pickup,
                 tasks=owner.tasks, all_options=owner.options, account_profile=owner.account_profile,
@@ -338,6 +345,8 @@ class _AccountRun:
             elif result.status not in (PAUSED, UNCERTAIN):
                 detail = result.detail if BAG_FULL_HINT in result.detail else _join(result.detail, BAG_FULL_HINT)
                 result = replace(result, status=PAUSED, detail=detail)
+        if result is not None and result.status in (BLOCKED, ERROR) and is_kicked(result.detail):
+            result = replace(result, status=PAUSED)  # 被踢下线：任务自己把错误吞成了受阻也按暂停，同账号后面的不再做，点“继续”补做
         if result is not None and result.status == PAUSED and result.progress is None and ctx.progress:
             result = replace(result, progress=dict(ctx.progress))
         return result

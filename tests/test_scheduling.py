@@ -356,12 +356,11 @@ class BackgroundTests(unittest.TestCase):
         self.assertIs(self.win.stack.currentWidget(), self.win.pages["global"])
 
     def test_open_hour_tasks_are_on_weekly_page(self):
-        """有开放时间的任务回到周常页“有开放时间”那一块（手动执行在这里，定时在定时页）；世界Boss在周常那一块。"""
-        for tid in rules.OPEN_HOURS + (boss_raid.WORLD_ID,):
+        """有开放时间的任务回到周常页“有开放时间”那一块（手动执行在这里，定时在定时页）；世界Boss、联盟Boss在周常那一块。"""
+        for tid in rules.OPEN_HOURS + (boss_raid.WORLD_ID, "union_boss"):
             self.assertIn(tid, self.win.exec_btns)
-        for tid in ("union_boss", "garden"):
-            self.assertNotIn(tid, self.win.exec_btns)
-        self.assertIn("uid_lookup", self.win.summaries)  # 周常页最底下
+        self.assertNotIn("garden", self.win.exec_btns)
+        self.assertIn("uid_lookup", self.win.exec_btns)  # 周常页最底下
         self.assertNotIn("timed", self.win.pages)
 
     def test_uid_lookup_is_last_block_of_weekly_page(self):
@@ -394,7 +393,7 @@ class BackgroundTests(unittest.TestCase):
         self.assertIn(tid, self.win.auto_ids)
         self.assertIn(tid, self.win.count_vars)
         self.assertIn(tid, self.win.weekly_run_ids)
-        self.assertNotIn(tid, rules.BOSSES)
+        self.assertNotIn(tid, rules.HIDDEN)
         self.assertNotIn(tid, self.win.mode_vars)
         self.assertNotIn(tid, self.win.wide_labels)
         card = self.win.task_labels[tid]
@@ -476,6 +475,133 @@ class BackgroundTests(unittest.TestCase):
         [account] = launch.call_args.args[0]
         self.assertEqual((account.tasks, account.config.record_index), (("alliance",), 6))
         self.assertIn("定时·联盟贡献", launch.call_args.args[1])
+
+    def _clock(self, h, m):
+        """可以往后拨的服务器时间：self.now。"""
+        from datetime import datetime
+        from zmxy import servertime
+        self.now = datetime(2026, 11, 10, h, m)
+        self.enterContext(mock.patch.object(servertime, "clock", side_effect=lambda *a: self.now))
+
+    NET_FAIL = "登录/进入角色失败：连接 4399 平台失败（网络/证书）：平台 token 请求失败"
+
+    def net_back(self):
+        """登录因网络失败后，“联网了”的判断作废（重试前要先等网络通）；这里当作网络又通了。"""
+        self.assertEqual(self.win._net_ok_until, 0.0)
+        self.win._net_ok_until = float("inf")
+
+    def test_clock_item_network_failure_retries_same_day(self):
+        """2026-11-16 00:15 联盟贡献连不上 4399：原来按时刻的定时项不重试，当天就没做。现在过 5 分钟再试，再失败往后排。"""
+        from datetime import timedelta
+        self._clock(0, 15)
+        globalcfg = self._arm_global("alliance")
+        self.store.data["wide"] = {"u": {"alliance": {"on": False, "record": 7}}}
+        globalcfg.entry(self.store, "alliance", "u")["on"] = True
+        with mock.patch.object(self.win, "_launch") as launch:
+            self.win._tick_timers()
+            [name] = [a.name for a in launch.call_args.args[0]]
+            self.win.timed_names.add(name)
+            self.win._on_result((name, core.TaskResult("login", core.ERROR, self.NET_FAIL)))
+            self.win.timed_names.discard(name)
+            self.assertIn("00:20 第 1 次重试", self.log.read_text(encoding="utf-8"))
+            self.now += timedelta(minutes=5)
+            with mock.patch.object(self.win, "_net_ready", return_value=False):  # 网络还没恢复：到点了也先不登录
+                self.win._tick_timers()
+            self.assertEqual(launch.call_count, 1)
+            self.assertTrue(self.win.timer_queue)
+            self.win.timer_queue = []
+            self.now -= timedelta(minutes=5)
+            globalcfg.section(self.store, "alliance")["retry"][globalcfg.retry_key("u", None)]["at"] = "2026-11-10 00:20"
+            self.net_back()
+            self.now += timedelta(minutes=4)
+            self.win._tick_timers()
+            self.assertEqual(launch.call_count, 1)  # 还没到
+            self.now += timedelta(minutes=1)
+            self.win._tick_timers()
+            self.assertEqual(launch.call_count, 2)
+            [again] = launch.call_args.args[0]
+            self.assertEqual((again.tasks, again.config.record_index), (("alliance",), 6))
+            self.win.timed_names.add(again.name)
+            self.win._on_result((again.name, core.TaskResult("login", core.ERROR, self.NET_FAIL)))
+            self.assertIn("00:35 第 2 次重试", self.log.read_text(encoding="utf-8"))
+            self.net_back()
+            self.now += timedelta(minutes=30)
+            self.win._tick_timers()
+            self.win._tick_timers()  # 用掉了：同一次不重复
+        self.assertEqual(launch.call_count, 3)
+
+    def test_daily_retry_redoes_only_the_failed_save(self):
+        """“日常和活动”：存档 3 登录连不上，重试只做存档 3，不再做账号级部分和别的存档。"""
+        from datetime import timedelta
+        self._clock(12, 0)
+        globalcfg = self._arm_global(globalcfg_mod().DAILY)
+        saves = self.store.accounts[0]["saves"]
+        saves["1"] = {"tasks": ["wish_pool"]}
+        saves["3"] = {"tasks": ["wish_pool", "growth_road"]}
+        self.store.data["wide"] = {"u": {"vip_gift": {"on": True, "record": 2}}}
+        globalcfg.entry(self.store, globalcfg.DAILY, "u")["slots"] = [1, 3]
+        with mock.patch.object(self.win, "_launch") as launch:
+            self.win._tick_timers()
+            first = launch.call_args.args[0]
+            self.assertEqual([a.config.record_index + 1 for a in first], [2, 1, 3])
+            failed = next(a.name for a in first if a.config.record_index == 2)
+            self.win.timed_names.update(a.name for a in first)
+            self.win._on_result((failed, core.TaskResult("login", core.ERROR, self.NET_FAIL)))
+            self.win.timed_names.clear()
+            self.assertIn("存档 3", self.log.read_text(encoding="utf-8").splitlines()[-1])
+            self.net_back()
+            self.now += timedelta(minutes=5)
+            self.win._tick_timers()
+        self.assertEqual(launch.call_count, 2)
+        self.assertEqual([(a.config.record_index + 1, a.tasks) for a in launch.call_args.args[0]], [(3, ("wish_pool", "growth_road"))])
+
+    def test_daily_retry_of_account_level_part(self):
+        from datetime import timedelta
+        self._clock(12, 0)
+        globalcfg = self._arm_global(globalcfg_mod().DAILY)
+        self.store.accounts[0]["saves"]["1"] = {"tasks": ["wish_pool"]}
+        self.store.data["wide"] = {"u": {"vip_gift": {"on": True, "record": 2}}}
+        globalcfg.entry(self.store, globalcfg.DAILY, "u")["slots"] = [1]
+        with mock.patch.object(self.win, "_launch") as launch:
+            self.win._tick_timers()
+            wide = next(a.name for a in launch.call_args.args[0] if a.tasks == ("vip_gift",))
+            self.win.timed_names.add(wide)
+            self.win._on_result((wide, core.TaskResult("login", core.ERROR, self.NET_FAIL)))
+            self.win.timed_names.clear()
+            self.net_back()
+            self.now += timedelta(minutes=5)
+            self.win._tick_timers()
+        self.assertEqual([a.tasks for a in launch.call_args.args[0]], [("vip_gift",)])
+
+    def test_clock_retry_does_not_cross_midnight(self):
+        from datetime import datetime
+        globalcfg = globalcfg_mod()
+        self.store.data["global"] = {}
+        self.assertEqual(globalcfg.schedule_retry(self.store, "alliance", "u#", datetime(2026, 11, 10, 23, 50)), "23:55")
+        self.assertEqual(globalcfg.schedule_retry(self.store, "alliance", "u#", datetime(2026, 11, 10, 23, 55)), None)  # 第 2 次要 15 分钟，跨天
+        self.assertNotIn("u#", globalcfg.section(self.store, "alliance")["retry"])
+        times = [globalcfg.schedule_retry(self.store, "alliance", "u#", datetime(2026, 11, 10, 1, 0)) for _ in range(6)]
+        self.assertEqual(times, ["01:05", "01:15", "01:30", "02:00", "03:00", None])  # 5 次用完
+
+    def test_weekly_auto_config_network_failure_retries_that_save(self):
+        from datetime import timedelta
+        from zmxy import protocol
+        self._clock(6, 0)
+        globalcfg = self._arm_global(globalcfg_mod().WEEKLY)
+        globalcfg.section(self.store, globalcfg.WEEKLY)["weekdays"] = list(range(7))
+        globalcfg.entry(self.store, globalcfg.WEEKLY, "u")["slots"] = [2]
+        with mock.patch.object(core, "read_auto", side_effect=protocol.AuthTransportError("平台 token 请求失败")), \
+                mock.patch.object(self.win, "_work"):
+            self.win._tick_timers()
+            self.drain()
+        retry = globalcfg.section(self.store, globalcfg.WEEKLY)["retry"]
+        self.assertEqual(retry[globalcfg.retry_key("u", 2)]["n"], 1, self.log.read_text(encoding="utf-8"))
+        self.net_back()
+        self.now += timedelta(minutes=5)
+        with mock.patch.object(core, "read_auto", return_value={}) as reader, mock.patch.object(self.win, "_work"):
+            self.win._tick_timers()
+            self.drain()
+        self.assertEqual(reader.call_count, 1)
 
     def test_daily_runs_page_ticks_of_picked_saves(self):
         """“日常和活动”：选中的存档做它在日常 / 活动页勾选的；周常、有自己定时项的任务、联盟贡献定时接管的跳过；账号级任务每账号一次。"""

@@ -14,7 +14,7 @@ from zmxy.tasks import boss_raid, pet_brawl, pvp_match  # noqa: F401  (确保已
 class LongRunningFlagTests(unittest.TestCase):
     def test_only_the_long_tasks_are_flagged(self):
         flagged = {t.id for t in core.load_tasks().values() if t.long_running}
-        self.assertEqual(flagged, {"pvp_match", "pet_brawl"})
+        self.assertEqual(flagged, {"pvp_match", "pet_brawl", "pet_brawl_pve"})
         for tid in flagged:
             self.assertTrue(core.load_tasks()[tid].force_warning)  # 确认框里要说清后果
 

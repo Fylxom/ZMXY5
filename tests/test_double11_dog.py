@@ -11,12 +11,12 @@ from tests.support import Fake, run, ts
 
 
 class Double11DogTests(unittest.TestCase):
-    def execute(self, used=0, extra=0, *, info=None, fault=None, stop=None):
+    def execute(self, used=0, extra=0, *, info=None, fault=None, stop=None, options=None):
         info = info if info is not None else {"everyDaySetting": {
             "double11LotteryCnt": used, "addDouble11LotteryCnt": extra}}
         cards = {"dog_1": 2}
         self.refreshes = 0
-        session = Session(p.ClientConfig(uid=1, username="u"))
+        session = Session(p.ClientConfig(uid=1, username="u", record_index=0))
 
         def refresh():
             self.refreshes += 1
@@ -59,12 +59,13 @@ class Double11DogTests(unittest.TestCase):
         with mock.patch.object(data, "row", side_effect=row), \
                 mock.patch.object(d.state, "table_rows", return_value=[{"consume_subType": "dog_1"}]), \
                 mock.patch.object(session, "refresh", side_effect=refresh):
-            return run(d.ID, self.conn, info, session=session, now=ts(2026, 11, 5), stop=stop)
+            return run(d.ID, self.conn, info, options, session=session, now=ts(2026, 11, 5), stop=stop)
 
     def test_registered_limited_without_paid_routes_or_options(self):
         spec = load_tasks()[d.ID]
         self.assertEqual(spec.group, "活动")
-        self.assertEqual(spec.writes, frozenset({d.R_DRAW}))
+        pool = d.dog_pool
+        self.assertEqual(spec.writes, frozenset({d.R_DRAW, pool.R_ACTIVE, pool.R_TO_CODE, pool.R_TO_DOG, pool.R_MONEY}))
         self.assertIsNone(spec.choices)
 
     def test_old_activity_table_sends_nothing(self):
@@ -79,6 +80,38 @@ class Double11DogTests(unittest.TestCase):
         self.assertEqual(result.status, "submitted", result.detail)
         self.assertEqual(len(self.conn.bodies("double11Lottery")), 1)
         self.assertEqual(self.refreshes, 2)
+
+    def test_not_in_pool_draws_own(self):
+        """开了轮转、但这个存档没参加：照旧只抽自己，不登录别的号。"""
+        pool = {"members": [{"user": "x", "slot": 1}, {"user": "y", "slot": 1}]}
+        with mock.patch.object(d.dog_pool, "run_round") as rnd:
+            result = self.execute(options={"pool": pool})
+        rnd.assert_not_called()
+        self.assertEqual(result.status, "submitted", result.detail)
+        self.assertEqual(len(self.conn.bodies("double11Lottery")), 1)
+
+    def test_manual_flag_passed(self):
+        pool = {"members": [{"user": "u", "slot": 1}, {"user": "y", "slot": 1}]}
+        with mock.patch.object(d.dog_pool, "run_round", return_value="round") as rnd:
+            self.execute(options={"pool": pool, "manual": True})
+        self.assertIs(rnd.call_args.kwargs["manual"], True)
+
+    def test_single_execute_marks_manual(self):
+        """单独点这一行的“执行”：选项里带 manual；别的任务、勾选执行不带。"""
+        from zmxy.core import Account
+        from zmxy.mainwin.running import RunningMixin
+        host = type("H", (), {"wide": set(), "specs": {}})()
+        acc = Account("x", p.ClientConfig(uid=1, username="u"), tasks=(d.ID, "other"), options={d.ID: {"pool": 1}})
+        narrow = RunningMixin._narrow_tasks
+        self.assertEqual(narrow(host, [acc], d.ID, None)[0].options[d.ID], {"pool": 1, "manual": True})
+        self.assertNotIn("manual", narrow(host, [acc], "other", None)[0].options.get("other", {}))
+        self.assertNotIn("manual", narrow(host, [acc], None, [d.ID])[0].options[d.ID])
+
+    def test_member_runs_round(self):
+        pool = {"members": [{"user": "u", "slot": 1}, {"user": "y", "slot": 1}]}
+        with mock.patch.object(d.dog_pool, "run_round", return_value="round") as rnd:
+            self.assertEqual(self.execute(options={"pool": pool}), "round")
+        rnd.assert_called_once()
 
     def test_extra_attempts_are_used_without_buying(self):
         result = self.execute(used=1, extra=3)

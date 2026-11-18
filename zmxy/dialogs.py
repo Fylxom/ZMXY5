@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from typing import Any
+from typing import Any, Callable
 
 from PySide6.QtGui import QPixmap
 from PySide6.QtWidgets import QGridLayout, QLabel, QVBoxLayout, QWidget
@@ -11,9 +11,9 @@ from . import core
 from .choice_dialog import ChoiceDialog
 from .refine_dialog import RefineDialog
 from .store import WEEKDAYS, Store
-from .widgets import SUB, Chip, Dialog, Field, Segmented, Switch, hbox, label, notice, vbox
+from .widgets import SUB, Chip, Dialog, Field, RButton, Segmented, Switch, hbox, label, notice, tip, vbox
 
-__all__ = ["AccountDialog", "CaptchaDialog", "ChoiceDialog", "FestivalDialog", "RefineDialog", "SaveDialog"]
+__all__ = ["AccountDialog", "CaptchaDialog", "ChoiceDialog", "FestivalDialog", "RefineDialog", "SaveDialog", "TargetDialog"]
 
 
 # ---- 账号对话框
@@ -236,5 +236,82 @@ class FestivalDialog(Dialog):
         entry.update({key: [value for value, _ in items if value in self.picked[key]]
                       for key, items in self.items.items()})
         self.acc.setdefault("options", {})[self.spec.id] = entry
+        self.saved = True
+        self.accept()
+
+
+class TargetDialog(Dialog):
+    """竞技场 / 斗宠大会 / 藏宝洞“指定”模式的对手：对方 UID + 角色编号。saved 后看 uid、role。
+    preview(对话框, uid, 角色编号)：点“预览”时调，后台只读查对方，查完调 show_preview 写结果。"""
+
+    def __init__(self, master: QWidget, title: str, slot: int, opts: dict[str, Any], note: str,
+                 preview: Callable[["TargetDialog", int, int | None], None] | None = None) -> None:
+        super().__init__(master, f"{title} · 存档 {slot} · 指定对手")
+        self.saved, self.uid, self.role = False, "", ""
+        self._preview = preview
+        row = hbox(spacing=8)
+        row.addWidget(label("对方 UID", 9, SUB))
+        self.uid_field = Field(str(opts.get("target_uid") or ""), width=150, height=30, digits=12)
+        self.uid_field.setPlaceholderText("对方 UID")
+        row.addWidget(self.uid_field)
+        row.addSpacing(12)
+        row.addWidget(label("角色编号", 9, SUB))
+        role = opts.get("target_role")
+        self.role_field = Field("" if role is None else str(role), width=64, height=30, digits=4)
+        self.role_field.setPlaceholderText("0")
+        row.addWidget(self.role_field)
+        row.addSpacing(12)
+        self.preview_btn = RButton("预览", self.preview, "side", height=30, size=9, width=64)
+        tip(self.preview_btn, "用当前存档登录，只读查一下填的这个人：名字、角色、战力，报没报名 / 洞府几星。\n"
+                              "预览期间这个账号不能执行任务；游戏里正登着这个账号的话会被顶下线。")
+        row.addWidget(self.preview_btn)
+        row.addStretch(1)
+        self.body.addLayout(row)
+        self.body.addSpacing(10)
+        self.result = label("", 9)  # 预览结果：正常颜色，和下面的灰色说明分开
+        self.result.setWordWrap(True)
+        self.result.setFixedWidth(400)
+        self.result.setContentsMargins(0, 0, 0, 10)
+        self.result.setVisible(False)
+        self.body.addWidget(self.result)
+        text = label(note, 9, SUB)
+        text.setWordWrap(True)
+        text.setFixedWidth(400)
+        self.body.addWidget(text)
+        self.buttons("保存", self.save)
+        self.on_return = self.save
+        self.uid_field.setFocus()
+
+    def _read(self, role_optional: bool = False) -> tuple[str, str] | None:
+        """role_optional：预览时编号可以空着（查对方现在用的角色，查完自动填上）；返回的编号空着 = ""。"""
+        uid, role = self.uid_field.get().strip(), self.role_field.get().strip()
+        if not uid.isdigit() or int(uid) <= 0:
+            notice(self, "提示", "请填写对方 UID")
+            return None
+        if not role.isdigit() and not (role_optional and not role):
+            notice(self, "提示", "请填写角色编号（从 0 数起）；不知道的话先空着点“预览”")
+            return None
+        return str(int(uid)), str(int(role)) if role else ""
+
+    def preview(self) -> None:
+        if self._preview is None or not self.preview_btn.enabled or (got := self._read(role_optional=True)) is None:
+            return
+        self.preview_btn.set_enabled(False)
+        self.show_preview("正在登录查询…" if got[1] else "没填角色编号：查对方现在用的角色…")
+        self._preview(self, int(got[0]), int(got[1]) if got[1] else None)
+
+    def show_preview(self, text: str, done: bool = False, role: int | None = None) -> None:
+        """role：没填编号时服务器返回的角色编号，编号框还空着就填上。"""
+        self.result.setText(text)
+        self.result.setVisible(True)
+        if role is not None and not self.role_field.get().strip():
+            self.role_field.set(str(role))
+        if done:
+            self.preview_btn.set_enabled(True)
+
+    def save(self) -> None:
+        if (got := self._read()) is None:
+            return
+        self.uid, self.role = got
         self.saved = True
         self.accept()

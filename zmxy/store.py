@@ -325,6 +325,27 @@ class Store:
         every = cfg.get("every", 0)
         return every if isinstance(every, int) and not isinstance(every, bool) and every >= 0 else 0
 
+    def dog_pool(self) -> dict[str, Any]:
+        """狗卡轮转的设置（全局，不分存档）：{"members": [{"user", "slot", "hub"}]}。"""
+        got = self.data.get("dog_pool")
+        if not isinstance(got, dict):
+            got = self.data["dog_pool"] = {"members": []}
+        if not isinstance(got.get("members"), list):
+            got["members"] = []
+        return got
+
+    def _with_dog_pool(self, options: dict[str, Any]) -> dict[str, Any]:
+        """把狗卡轮转的全局设置和各参加存档的名字带进任务选项（任务在哪个存档上跑都要知道全部参加的号）。"""
+        pool = self.data.get("dog_pool")
+        if isinstance(pool, dict) and pool.get("members"):
+            names = {}
+            for m in pool["members"]:
+                acc = next((a for a in self.accounts if isinstance(m, dict) and a.get("username") == m.get("user")), None)
+                if acc is not None and isinstance(m.get("slot"), int):
+                    names[f"{m['user']}#{m['slot']}"] = self.slot_name(self.label(acc), m["slot"])
+            options.setdefault("double11_dog", {}).update(pool=deepcopy(pool), labels=names)
+        return options
+
     def to_account(self, acc: dict[str, Any], on_cookie: Callable[[str], None] | None = None, slot: int = 1) -> Account:
         """某个存档的执行项。slot：界面 1-8。"""
         sv = self.save_view(acc, slot)
@@ -339,7 +360,7 @@ class Store:
             name=self.slot_name(self.label(acc), slot),
             config=to_client_config(mapping),
             tasks=tuple(sv.get("tasks", ())),
-            options=deepcopy(sv.get("options", {})),
+            options=self._with_dog_pool(deepcopy(sv.get("options", {}))),
             on_cookie=on_cookie,
             no_pickup=frozenset(sv.get("no_pickup", ())),
             tidy=self.tidy_every(sv),

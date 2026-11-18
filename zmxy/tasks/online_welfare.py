@@ -13,6 +13,9 @@ from ..core import BLOCKED, SKIPPED, SUBMITTED, TaskContext, TaskResult, Uncerta
 from .double_drop import ONLINE_ACTIVITY, ONLINE_CLAIMED, ONLINE_NAME, online_quest_id, weekdays
 
 ID = "online_welfare"
+WAIT_MAX = 1260  # 一档最多等这么久（最长的第 5 档 20 分钟，留一分钟余量）
+WAIT_ROUNDS = 3  # 等完服务器进度还没到（它约 5 分钟才记一次）最多再等几轮
+WAIT_SLACK = 5   # 取整和服务器记录延迟
 
 
 class _Halt(Exception):
@@ -85,6 +88,7 @@ class _Run:
     def __init__(self, ctx: TaskContext, first: int, chain: list[int], info, statuses: Mapping[int, int]) -> None:
         self.ctx, self.first, self.chain, self.info, self.statuses = ctx, first, chain, info, statuses
         self.gains, self.got, self.done = dungeon.Gains(), [], []
+        self.counted: set[int] = set()  # 本地倒计时已到的档（照客户端 OnlineTaskCmd：不等服务器进度更新，到点就提交）
 
     def reload(self, claimed: str) -> None:
         """领完一档后服务器才开放下一档：重读 info 和状态。"""
@@ -127,10 +131,35 @@ class _Run:
         self.reload("、".join(self.got) or "首档已领过")
         return None
 
+    def wait_for(self, qid: int, name: str) -> bool:
+        """这一档在计时（status=1、服务器有进度）就在线等到时长够，再刷新状态。等不了（没有进度、太久、停止、断线）返回 False。
+        等够了就算这一档到点（``counted``）：客户端也是按读到的进度本地倒计时、到点直接提交；
+        服务器记录里的 progress 不会跟着涨（2026-11-15 真机：等了 9 分钟一直是 1029/1200）。没到的话服务器会拒绝，不会多领。"""
+        row = state.row("OnlineReward", qid) or {}
+        target, amount = state.num(row.get("targetNum")), server_progress(self.info, qid, row.get("targetId"))
+        if self.statuses.get(qid) != quest.DOING or not target or target <= 0 or amount is None:
+            return False
+        need = max(30, target - amount + WAIT_SLACK)
+        if need > WAIT_MAX:
+            return False
+        waited = 0
+        while waited < need:
+            step = min(30, need - waited)
+            if self.ctx.stopped or not self.ctx.sleep(step, background=False):
+                return False
+            waited += step
+            self.ctx.log(f"在线福利：等{name} {waited}/{need} 秒（读到的进度 {amount}/{target}）")
+        self.counted.add(qid)
+        self.reload("、".join(self.got) or "无")
+        return True
+
     def claim_chain(self) -> TaskResult:
         chain = self.chain
         waiting, failed, unready, stopped = [], "", "", False
-        for index, qid in enumerate(chain):
+        rounds: dict[int, int] = {}
+        index = 0
+        while index < len(chain):
+            qid = chain[index]
             rest = [reward_name(x) for x in chain[index:]]
             if self.ctx.stopped:
                 waiting, stopped = rest, True
@@ -138,8 +167,18 @@ class _Run:
             status = self.statuses.get(qid)
             if status == quest.DONE:
                 self.done.append(rest[0])
+                index += 1
                 continue
-            if not claim_ready(self.info, qid, self.statuses, [self.first, *chain]):
+            ready = (claim_ready(self.info, qid, self.statuses, [self.first, *chain])
+                     or (qid in self.counted and self.statuses.get(qid) == quest.DOING))
+            if not ready and rounds.get(qid, 0) < WAIT_ROUNDS:  # 还没到时长：在线等着，到了再领（原来不等，第 5 档 20 分钟常常领不到）
+                rounds[qid] = rounds.get(qid, 0) + 1
+                if self.wait_for(qid, rest[0]):
+                    continue
+                if self.ctx.stopped:
+                    waiting, stopped = rest, True
+                    break
+            if not ready:
                 row = state.row("OnlineReward", qid) or {}
                 amount = server_progress(self.info, qid, row.get("targetId"))
                 unready = f"未就绪记录：qId={qid}，status={status}，progress={amount}，target={state.num(row.get('targetNum'))}"
@@ -150,6 +189,7 @@ class _Run:
                 break
             if index + 1 < len(chain):
                 self.reload("、".join(self.got) or "无")
+            index += 1
         parts = [x for x in (
             f"已领取 {'、'.join(self.got)}{dungeon.gain_note(self.gains)}" if self.got else "",
             f"此前已领取：{'、'.join(self.done)}" if self.done and not waiting else "",

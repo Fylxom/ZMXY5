@@ -458,6 +458,58 @@ class RunnerTests(unittest.TestCase):
             self.assertEqual((res[0].status, dict(res[0].progress)), ("paused", {"n": 3}))
             self.assertEqual(res[0].detail, str(exc))  # 日志保持原样
 
+    def test_swallowed_kick_pauses_and_stops_remaining(self):
+        fake = mock.MagicMock()
+        fake.__enter__.return_value = fake
+        calls = []
+
+        def swallow(ctx):  # 任务自己接住了连接错误，返回受阻
+            calls.append("a")
+            return core.TaskResult("a", "blocked", "读取今天的关卡失败：Pomelo 连接尚未完成握手")
+
+        specs = {"a": core.TaskSpec("a", "a", swallow), "b": core.TaskSpec("b", "b", lambda c: calls.append("b"))}
+        with mock.patch("zmxy.runner.load_tasks", return_value=specs), mock.patch("zmxy.session.Session", return_value=fake):
+            res = core.run_account(Account("n", p.ClientConfig(uid=1, username="u"), tasks=("a", "b")))
+        self.assertEqual(calls, ["a"])
+        self.assertEqual([r.status for r in res], ["paused"])
+
+    def test_dropped_connection_relogs_before_next_task(self):
+        fake = mock.MagicMock()
+        fake.__enter__.return_value = fake
+        fake.dropped = False
+        calls = []
+
+        def timeout(ctx):  # 只读查询超时：协议层关掉了连接，任务按受阻结束
+            calls.append("a")
+            fake.dropped = True
+            return core.TaskResult("a", "blocked", "等待 查询师徒副本奖励 响应超时")
+
+        def relogin():
+            calls.append("relogin")
+            fake.dropped = False
+
+        fake.relogin.side_effect = relogin
+        specs = {"a": core.TaskSpec("a", "a", timeout),
+                 "b": core.TaskSpec("b", "b", lambda c: calls.append("b") or core.TaskResult("b", "submitted"))}
+        with mock.patch("zmxy.runner.load_tasks", return_value=specs), mock.patch("zmxy.session.Session", return_value=fake):
+            res = core.run_account(Account("n", p.ClientConfig(uid=1, username="u"), tasks=("a", "b")))
+        self.assertEqual(calls, ["a", "relogin", "b"])
+        self.assertEqual([r.status for r in res], ["blocked", "submitted"])
+
+    def test_dropped_connection_pauses_when_relogin_fails(self):
+        fake = mock.MagicMock()
+        fake.__enter__.return_value = fake
+        fake.dropped = True
+        fake.relogin.side_effect = p.AllianceError("网络不可用")
+        calls = []
+        specs = {"a": core.TaskSpec("a", "a", lambda c: calls.append("a")),
+                 "b": core.TaskSpec("b", "b", lambda c: calls.append("b"))}
+        with mock.patch("zmxy.runner.load_tasks", return_value=specs), mock.patch("zmxy.session.Session", return_value=fake):
+            res = core.run_account(Account("n", p.ClientConfig(uid=1, username="u"), tasks=("a", "b")))
+        self.assertEqual(calls, [])
+        self.assertEqual([r.status for r in res], ["paused"])
+        self.assertIn("重新登录失败", res[0].detail)
+
     def test_paused_result_carries_ctx_progress(self):
         fake = mock.MagicMock()
         fake.__enter__.return_value = fake

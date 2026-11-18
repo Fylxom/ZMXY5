@@ -20,11 +20,19 @@ def read_error(exc: Exception) -> str:
     return login.explain(exc) if isinstance(exc, p.AllianceError) else f"{type(exc).__name__}: {exc}"
 
 
+MANUAL_MARKED = frozenset({"double11_dog"})  # 单独点“执行”时在选项里带上 manual=True 的任务（狗卡轮转：今天做过也再做一轮）
+
 class RunningMixin:
     def _busy(self, user: str | None = None) -> bool:
         """这个登录账号（默认当前选中的）有没有执行在跑。别的账号在跑不算：各账号互不影响。"""
         user = self._user() if user is None else user
         return any(user in job.users for job in self.jobs)
+
+    def _owner(self, users: Iterable[str]) -> str:
+        """系统行的账号列：这次执行占着的账号（按账号列表顺序，“、”隔开），只看某个账号的日志时只出现在它自己那里。"""
+        users = set(users)
+        names = [self.store.label(a) for a in self.store.accounts if a.get("username", "") in users]
+        return "、".join(dict.fromkeys(names)) or "—"
 
     def _can_task(self) -> bool:
         """当前账号能不能点任务的“执行”：没在跑，或者在跑的是可以插任务的执行（护送经书等船）。"""
@@ -65,6 +73,7 @@ class RunningMixin:
                 self._ask_stop(jobs, live)
                 return
             for job in jobs:
+                self._add_log(self._owner(job.users), "停止", "info", "用户点了停止")
                 job.stop.set()
         elif not self._busy() and self.store.has_resume():
             self.resume()
@@ -81,10 +90,10 @@ class RunningMixin:
             if job not in self.jobs:  # 弹窗期间任务可能已经自己结束
                 continue
             if answer == 1:
-                self._add_log("—", "系统", "info", "用户选了打完这场再停")
+                self._add_log(self._owner(job.users), "停止", "info", "用户选了打完这场再停")
                 core.stop_after(job.stop)
             elif any(t in self.specs and self.specs[t].long_running for t in core.engaged(job.stop)):
-                self._add_log("—", "系统", "info", "用户选了立即停止")  # 斗神大会、灵宠乱斗一场要等几分钟才响应普通停止：强制断开
+                self._add_log(self._owner(job.users), "停止", "info", "用户选了立即停止")  # 斗神大会、灵宠乱斗一场要等几分钟才响应普通停止：强制断开
                 core.force_stop(job.stop)
             else:
                 job.stop.set()
@@ -135,9 +144,11 @@ class RunningMixin:
 
     def _launch(self, accounts: list, label_: str, stay: bool = False, timed: frozenset[str] = frozenset()) -> None:
         stop = threading.Event()  # 每次执行各有各的停止标志
-        self._add_log("—", "系统", "info", f"{label_}执行开始")
+        users = {a.config.username for a in accounts}
+        first = not any(job.stop is not None for job in self.jobs)  # 之前没有账号在执行：“全部账号”页也显示这次开始
+        self._add_log(self._owner(users), "系统", "info", f"{label_}执行开始", everywhere=first)
         self._jump_to_log(stay)
-        self._spawn(lambda: self._work(accounts, stop), {a.config.username for a in accounts}, stop, timed)
+        self._spawn(lambda: self._work(accounts, stop), users, stop, timed)
 
     def _with_peers(self, accounts: list) -> list:
         """师徒试炼要同时登录另一个账号。"""
@@ -217,7 +228,11 @@ class RunningMixin:
             regular_tasks = tuple(t for t in tasks if t not in self.wide)
             return [replace(a, tasks=regular_tasks) for a in accounts]  # 账号级周常走其选定存档，普通周常按当前存档及归库设置执行
         if only:  # 单个任务：账号级任务只走 wide（用它自己选的存档），普通任务对每个选中存档执行
-            return [] if only in self.wide else [replace(a, tasks=(only,), tidy=None) for a in accounts]  # 单个任务不归库
+            if only in self.wide:
+                return []
+            marked = only in MANUAL_MARKED  # 这些任务要知道是用户单独点的“执行”（定时只勾它一项时任务集合也一样，分不出来）
+            return [replace(a, tasks=(only,), tidy=None,  # 单个任务不归库
+                            options={**a.options, only: {**a.options.get(only, {}), "manual": True}} if marked else a.options) for a in accounts]
         return [replace(a, tasks=tuple(t for t in a.tasks if t not in self.wide and getattr(self.specs.get(t), "group", None) != WEEKLY)) for a in accounts]
 
     def _confirm_start(self, what: str) -> bool:

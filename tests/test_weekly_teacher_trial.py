@@ -281,6 +281,44 @@ class TeacherTrialTests(unittest.TestCase):
         self.assertEqual(master._conn.routes().count("getMasterCopyReward"), 2)  # 两次都领到了
         self.assertEqual(master._conn.routes().count("createWaitingRoom"), 3)   # 失败的那场 + 两场成功
 
+    def _drops(self, master, fail_times):
+        """奖励查询前 fail_times 次超时并把师傅主连接标成断开；relogin 把它接回来。"""
+        base, gone, log = master._conn.handler, set(), []
+
+        def h(route, body):
+            if route.endswith("getMasterCopyRewardData") and log.count("fail") < fail_times and "fail-now" not in log:
+                log.append("fail")
+                gone.add(id(master))
+                raise p.AllianceError("等待 查询师徒副本奖励 响应超时")
+            return base(route, body)
+
+        master._conn.handler = h
+        master.relogin = lambda: (log.append("relogin"), gone.discard(id(master)))
+        return mock.patch.object(Session, "dropped", property(lambda s: id(s) in gone)), log
+
+    def test_dropped_reward_query_relogs_and_rechecks_same_battle(self):
+        # 2026-11-11 真机：第 18 次领奖查询“超时”，连接被关，整个任务停了
+        spec, master, student, teams = make("master", used=10)
+        patch, log = self._drops(master, 1)
+        logs = []
+        with patch, mock.patch("time.sleep", lambda s: None):
+            r = spec.run(TaskContext(master, {"student": "s|1", "times": 2}, log=logs.append))
+        self.assertEqual(r.status, "submitted", r.detail)
+        self.assertEqual(log, ["fail", "relogin"])
+        self.assertEqual(master._conn.routes().count("createWaitingRoom"), 2)  # 补查同一场，不另开一场
+        self.assertEqual(master._conn.routes().count("getMasterCopyReward"), 2)
+        self.assertTrue(any("已重新登录" in x and "补查" in x for x in logs))
+
+    def test_repeated_drops_stop_after_reconnect_limit(self):
+        spec, master, student, teams = make("master", used=10)
+        patch, log = self._drops(master, 99)
+        with patch, mock.patch("time.sleep", lambda s: None):
+            r = spec.run(TaskContext(master, {"student": "s|1", "times": 3}))
+        self.assertEqual(r.status, "blocked")
+        self.assertIn("响应超时", r.detail)
+        self.assertEqual(log.count("relogin"), tt.MAX_RECONNECTS)
+        self.assertNotIn("getMasterCopyReward", master._conn.routes())
+
     def test_two_battles_in_a_row_without_reward_stop_the_task(self):
         spec, master, student, teams = make("master", used=10)
         base = master._conn.handler

@@ -34,7 +34,10 @@ class OnlineWelfareTests(unittest.TestCase):
         session._conn = conn
         session._link = login.Link(conn, session.config, [{"index": 0}], {"time": FRIDAY})
         session.bind(core.load_tasks()[welfare.ID])
-        return core.TaskContext(session, stop=stop), conn
+        ctx = core.TaskContext(session, stop=stop)
+        self.slept = []
+        ctx.sleep = lambda seconds, background=True: self.slept.append(seconds) or not (stop and stop.is_set())  # 不真等
+        return ctx, conn
 
     def test_claims_first_then_refreshes_before_unlocking_each_next_reward(self):
         received = set()
@@ -197,14 +200,84 @@ class OnlineWelfareTests(unittest.TestCase):
         from zmxy import state
         qid = self.chain[0]
         row = state.row("OnlineReward", qid)
-        for progress in (None, {}, {str(row["targetId"]): row["targetNum"] - 1},
-                         {str(row["targetId"]): "bad"}):
+        for progress in (None, {}, {str(row["targetId"]): "bad"}):
             with self.subTest(progress=progress):
                 info = self.info({self.first: quest.DONE, qid: quest.DOING})
                 info["quest"][-1]["progress"] = progress
                 ctx, conn = self.context(lambda: info)
                 welfare.run(ctx)
                 self.assertEqual(conn.bodies(quest.R_COMMIT), [])
+
+    def test_waits_online_until_last_tier_is_ready_then_claims_it(self):
+        # 2026-11-13 真机：第 5 档（20 分钟）progress=3/1200，原来不等直接结束，没领到
+        from zmxy import state
+        last, total = self.chain[-2], self.chain[-1]
+        row = state.row("OnlineReward", last)
+        received = {self.first, *self.chain[:-2]}
+
+        def reader():
+            statuses = {qid: quest.DONE for qid in received}
+            if last not in received:
+                statuses[last] = quest.DOING
+                info = self.info(statuses)
+                done = row["targetNum"] if sum(self.slept) >= row["targetNum"] - 3 else 3
+                info["quest"][-1]["progress"] = {str(row["targetId"]): done}
+                return info
+            statuses[total] = quest.DOING
+            return self.info(statuses)
+
+        def commit(body):
+            received.add(body["qId"])
+            return {}
+
+        ctx, conn = self.context(reader, commit)
+        result = welfare.run(ctx)
+        self.assertEqual(result.status, core.SUBMITTED, result.detail)
+        self.assertEqual(conn.bodies(quest.R_COMMIT), [{"qId": last}, {"qId": total}])
+        self.assertGreaterEqual(sum(self.slept), row["targetNum"] - 3)
+        self.assertLessEqual(sum(self.slept), welfare.WAIT_MAX)
+
+    def test_claims_after_local_countdown_even_if_server_progress_is_stale(self):
+        # 2026-11-15 真机：第 5 档等了 9 分钟，服务器记录一直是 1029/1200，三轮等完没领。客户端是本地倒计时到点就提交
+        from zmxy import state
+        last, total = self.chain[-2], self.chain[-1]
+        row = state.row("OnlineReward", last)
+        received = {self.first, *self.chain[:-2]}
+
+        def reader():
+            statuses = {qid: quest.DONE for qid in received}
+            if last not in received:
+                statuses[last] = quest.DOING
+                info = self.info(statuses)
+                info["quest"][-1]["progress"] = {str(row["targetId"]): row["targetNum"] - 171}  # 一直不涨
+                return info
+            statuses[total] = quest.DOING
+            return self.info(statuses)
+
+        def commit(body):
+            received.add(body["qId"])
+            return {}
+
+        ctx, conn = self.context(reader, commit)
+        result = welfare.run(ctx)
+        self.assertEqual(result.status, core.SUBMITTED, result.detail)
+        self.assertEqual(conn.bodies(quest.R_COMMIT), [{"qId": last}, {"qId": total}])
+        self.assertGreaterEqual(sum(self.slept), 171)
+        self.assertLess(sum(self.slept), 400)  # 只等一轮
+
+    def test_local_countdown_refused_is_reported_not_retried(self):
+        from zmxy import state
+        last = self.chain[-2]
+        row = state.row("OnlineReward", last)
+        statuses = {qid: quest.DONE for qid in (self.first, *self.chain[:-2])}
+        statuses[last] = quest.DOING
+        info = self.info(statuses)
+        info["quest"][-1]["progress"] = {str(row["targetId"]): row["targetNum"] - 100}
+        ctx, conn = self.context(lambda: info, lambda body: "任务未完成")
+        result = welfare.run(ctx)
+        self.assertEqual(conn.bodies(quest.R_COMMIT), [{"qId": last}])
+        self.assertIn("领取被拒绝", result.detail)
+        self.assertEqual(result.status, core.BLOCKED)
 
     def test_cumulative_reward_requires_all_previous_tiers_done(self):
         order = [self.first, *self.chain]

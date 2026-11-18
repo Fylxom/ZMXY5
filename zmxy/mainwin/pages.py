@@ -8,7 +8,8 @@ from PySide6.QtCore import Qt
 from PySide6.QtWidgets import QGridLayout, QLabel, QSizePolicy, QStackedWidget, QVBoxLayout, QWidget
 
 from .. import core, pickup
-from ..tasks import boss_raid, last_rewards, pet_catch, refine, time_boat, warehouse_sync
+from ..tasks.events import double11_dog
+from ..tasks import arena, boss_raid, last_rewards, pet_catch, refine, time_boat, warehouse_sync
 from ..widgets import (ACCENT, SUB, TEXT, WARN, Card, Chip, Field, FlowLayout, RButton, Segmented, Switch, elide_label, font, hbox, hint, label, scroll_page, set_fg, tip, vbox)
 from .parts import TaskRow
 from .rules import DISPLAY_ORDER, DISPLAY_RANK, GROUP_ORDER, HIDDEN, LIMITED, OPEN_HOURS, TONGTIAN, WEEKLY, WEEKLY_BOTTOM
@@ -148,7 +149,7 @@ class PagesMixin:
         self._open_hours_card(page)
         self._build_boat(page)
         self._build_pet_catch(page)
-        self._weekly_card(page, "查询", [self.specs[t] for t in WEEKLY_BOTTOM])  # 和定时无关，放最底下
+        self._build_uid_card(page)  # 和定时无关，放最底下
 
     def _weekly_card(self, page: QVBoxLayout, title: str, specs: list[core.TaskSpec], switches: bool = False, note: str = "") -> None:
         """一块：够宽时一行放两个任务，各列上下对齐（任务名 | 选了什么 | 按钮 | 次数 | 执行 | 开关）；
@@ -307,7 +308,7 @@ class PagesMixin:
         """不拾取（按存档）：选中的掉落种类留在地上。"""
         skip = hbox(spacing=6, margins=(2, 0, 0, 6))
         title = label("不拾取", 9, SUB)
-        tip(title, "按存档各自设置。副本里这几类地面掉落不捡，认不出的照常捡。")
+        tip(title, "按存档各自设置，只管副本里的地面掉落。\n物品 = 前四类以外的所有掉落（精英“只捡强化石”的强化石照捡）。")
         skip.addWidget(title)
         skip.addSpacing(4)
         for key, text in pickup.OPTIONS:
@@ -365,12 +366,19 @@ class PagesMixin:
                 tip(seg, spec.mode_note)
             row.addWidget(seg)
             row.addSpacing(8)
+            if any(v == arena.TARGET for v, _ in spec.modes):  # 竞技场 / 斗宠：选了“指定”才出现对手摘要和“选择”按钮
+                box = QWidget()
+                self.foe_rows[spec.id] = (box, self._row_picker(hbox(box), "选择", lambda s=spec: self.choose_target(s)))
+                box.setVisible(False)
+                row.addWidget(box)
         if spec.choices:
             if spec.id == boss_raid.WORLD_ID:
                 row.addSpacing(8)
             self.summaries[spec.id] = self._row_picker(row, "刷新" if spec.id == "tongtian_escort" else spec.choices.button, lambda s=spec: self.choose(s))
         if spec.id == refine.ID:  # 自动洗练：点“选择”进去分法宝 / 羽毛 / 阵法三块
             self.refine_lbl = self._row_picker(row, "选择", self.open_refine)
+        if spec.id == double11_dog.ID:  # 狗卡多号轮转：选哪些号参加、谁集卡（全局设置，不分存档）
+            self.dog_lbl = self._row_picker(row, "选择", self.open_dog_pool)
         if spec.account_wide and spec.id != boss_raid.WORLD_ID:  # 世界Boss的存档并入选择摘要，入口在选择框内
             self.wide_labels[spec.id] = self._row_picker(row, "选存档", lambda s=spec: self.choose_save(s))
         self.task_vars[spec.id] = Switch(False, self.save_tasks)

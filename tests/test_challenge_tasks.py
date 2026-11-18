@@ -573,6 +573,45 @@ class TreasureCaveTests(unittest.TestCase):
         with self.assertRaises(UncertainOutcome):
             run("treasure_cave", Fake(handler), {"everyDaySetting": {}})
 
+    TARGET = {"mode": "target", "target_uid": "1000000001", "target_role": "3"}
+
+    def target_conn(self, published):
+        def handler(route, body):
+            if route.endswith("getRecommend"):
+                return self.RECS
+            if route.endswith("getPublishLandform") and body.get("rid") == "1000000001_r3":
+                return published
+        return Fake(handler)
+
+    def test_target_mode_fights_highest_star_cave(self):
+        conn = self.target_conn({"data": [
+            {"entityId": "1000000001_r3_1", "userdata": {"defensiveLevel": 6, "username": "测试玩家"}},
+            {"entityId": "1000000001_r3_2", "userdata": {"defensiveLevel": 8, "username": "测试玩家"}}]})
+        r = run("treasure_cave", conn, {"everyDaySetting": {"landformChallengeCnt": 3}}, self.TARGET)
+        self.assertEqual(conn.bodies("beginBattle"), [{"entityId": "1000000001_r3_2"}] * 2)
+        self.assertNotIn("getRecommend", conn.routes())
+        self.assertIn("指定洞府 测试玩家（1000000001_r3）", r.detail)
+        self.assertNotEqual(r.status, "blocked", r.detail)
+
+    def test_target_not_published_falls_back_to_recommend_and_is_not_green(self):
+        conn = self.target_conn({"data": []})
+        r = run("treasure_cave", conn, {"everyDaySetting": {"landformChallengeCnt": 3}}, self.TARGET)
+        self.assertEqual(r.status, "blocked", r.detail)
+        self.assertEqual(conn.bodies("beginBattle"), [{"entityId": "b"}] * 2)  # 剩下的按推荐中间那个
+        self.assertIn("指定洞府打不了（对方没有发布洞府），剩下的改打推荐", r.detail)
+        self.assertIn("藏宝洞挑战 2 次", r.detail)
+
+    def test_target_mode_without_target_blocks(self):
+        conn = self.conn()
+        r = run("treasure_cave", conn, {"everyDaySetting": {}}, {"mode": "target", "target_uid": "5"})
+        self.assertEqual(r.status, "blocked")
+        self.assertNotIn("beginBattle", conn.routes())
+
+    def test_modes(self):
+        spec = load_tasks()["treasure_cave"]
+        self.assertEqual(spec.modes, (("target", "指定"), ("recommend", "推荐")))
+        self.assertEqual(spec.default_mode, "recommend")
+
 
 class TreasureCaveFairyTests(unittest.TestCase):
     """藏宝洞打完顺带领仙魄：次数用完也领；领取被阻止时整体报阻止、挑战结果照写；挑战结果未知就不领。"""
@@ -807,9 +846,72 @@ class ArenaTests(unittest.TestCase):
         self.assertEqual(arena.strongest(arena.PET_ARENA, recs), 3)
         self.assertEqual(arena.weakest(arena.PET_ARENA, recs), 4)  # 同战力取靠后的
 
+    def test_target_mode_fights_given_rid_outside_recommend(self):
+        for task_id, prefix, detail in (("arena", self.A, "getArenaTargetInfo"), ("pet_arena", self.P, "getArenaUserData")):
+            with self.subTest(task_id=task_id):
+                conn = self.conn(arena_info(jjcChallengeNum="2;2;2;2;2;2;2"), prefix=prefix,
+                                 details={"userData": {"name": "老王", "entityId": "e"}})
+                r = run(task_id, conn, {}, {"mode": "target", "target_uid": "1000000002", "target_role": "19"})
+                self.assertEqual(r.status, "submitted", r.detail)
+                self.assertEqual(conn.bodies(detail), [{"targetId": "1000000002_r19"}] * 2)
+                self.assertEqual(conn.bodies("endArenaBattle"), [{"targetId": "1000000002_r19", "win": 1}] * 2)
+                self.assertEqual(conn.bodies("sweep"), [])
+                self.assertIn("指定对手 老王（1000000002_r19）", r.detail)
+
+    def test_feats_per_battle_are_logged(self):
+        info = arena_info(jjcChallengeNum="2;2;2;2;2;2;2", sweepEnergy=4,
+                          self={"rid": "9_r0", "index": 0, "p1": {"fightPower": 2000}})
+        for row in info["recommend"]:
+            row.update(p1={"fightPower": 100 * row["rid"]}, totalScore=1000 * row["rid"])
+        base = self.conn(info, sweep=lambda b: {"sweepEnergy": 0, "battleScore": 40})
+
+        def handler(route, body):
+            return {"battleScore": 41} if route.endswith("endArenaBattle") else base.handler(route, body)
+        conn = Fake(handler)
+        r = run("arena", conn, {}, SW)
+        self.assertEqual(r.status, "submitted", r.detail)
+        self.assertIn("功勋共 +81：扫荡+40（我2000/对手800/对手战功8000），手打+41（我2000/对手", r.detail)
+
+    def test_target_unavailable_falls_back_to_top_and_is_not_green(self):
+        info = arena_info(jjcChallengeNum="2;2;2;2;2;2;2")
+        for row in info["recommend"]:
+            row["p1"] = {"fightPower": 100 * row["rid"] if row["rid"] != 5 else 9999}
+        base = self.conn(info)
+
+        def handler(route, body):
+            if route.endswith("getArenaTargetInfo") and body["targetId"] == "1000000003_r0":
+                return "获取竞技场信息错误"
+            return base.handler(route, body)
+        conn = Fake(handler)
+        r = run("arena", conn, {}, {"mode": "target", "target_uid": "1000000003", "target_role": "0"})
+        self.assertEqual(r.status, "blocked", r.detail)  # 打满了也不显示绿色
+        self.assertEqual(conn.bodies("getArenaTargetInfo")[0], {"targetId": "1000000003_r0"})  # 只试一次指定对手
+        self.assertEqual(conn.bodies("endArenaBattle"), [{"targetId": 5, "win": 1}] * 2)  # 剩下的按榜首（战力最高的 5 号）
+        self.assertIn("已挑战 2/2 次", r.detail)
+        self.assertRegex(r.detail, r"指定对手打不了（.*获取竞技场信息错误.*），剩下的改打榜首")
+        self.assertIn("功勋共 +?：", r.detail)  # 服务器没给功勋：不写成 +0
+        self.assertNotIn("指定对手 x", r.detail)
+
+    def test_target_mode_without_target_or_self_blocks(self):
+        for opts, info in (({"mode": "target"}, arena_info()),
+                           ({"mode": "target", "target_uid": "12", "target_role": "x"}, arena_info()),
+                           ({"mode": "target", "target_uid": "12", "target_role": "3"}, arena_info(self={"rid": "12_r3"}))):
+            with self.subTest(opts=opts):
+                conn = self.conn(info)
+                self.assertEqual(run("arena", conn, {}, opts).status, "blocked")
+                self.assertNotIn("beginArenaBattle", conn.routes())
+
+    def test_target_rid_and_summary(self):
+        from zmxy.tasks import arena as ar
+        self.assertEqual(ar.target_rid({"target_uid": " 0123 ", "target_role": "0"}), "123_r0")
+        self.assertIsNone(ar.target_rid({"target_uid": "0", "target_role": "1"}))
+        self.assertIsNone(ar.target_rid({"target_uid": "5"}))
+        self.assertEqual(ar.target_summary({"target_uid": "5", "target_role": 2}), "UID 5 · 编号 2")
+        self.assertEqual(ar.target_summary({}), "没填对手")
+
     def test_modes_are_top_bottom_sweep(self):
         spec = load_tasks()["arena"]
-        self.assertEqual(spec.modes, (("manual", "榜首"), ("bottom", "榜尾"), ("sweep", "扫荡")))
+        self.assertEqual(spec.modes, (("target", "指定"), ("manual", "榜首"), ("bottom", "榜尾"), ("sweep", "扫荡")))
         self.assertEqual(load_tasks()["pet_arena"].modes, spec.modes)
         self.assertEqual(spec.default_mode, "sweep")
 
@@ -977,7 +1079,7 @@ class ArenaTests(unittest.TestCase):
         session._link = login.Link(conn, session.config, [{"index": 0}], {"time": ts(2026, 10, 1)})
         session.bind(load_tasks()["arena"])
         shown = []
-        job = ar.Job(TaskContext(session, SW, report=shown.append), ar.ARENA, "sweep")
+        job = ar.Job(TaskContext(session, SW, report=shown.append), ar.ARENA, {"mode": "sweep"})
         job.begin()
         self.assertTrue(job.step())  # 扫一次，能量用完
         self.assertEqual((job.swept, job.can_sweep, job.ready_at() - job.last), (1, True, ar.SWEEP_GAP))

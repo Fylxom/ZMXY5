@@ -76,6 +76,24 @@ class LogTableTests(unittest.TestCase):
         self.assertEqual(self.table.trails[0][-1][1:], (core.SUBMITTED, "已领取奖励"))
         self.assertFalse(self.table.live)
 
+    def test_system_rows_only_show_under_their_own_accounts(self):
+        t = self.table
+        t.add(("22:00:00", "账号1", "系统", "info", "执行开始"), everywhere=True)  # 第一个开始
+        t.add(("22:00:01", "账号9 · 存档 1", "主线关卡", "submitted", "完成"))
+        t.add(("22:00:02", "账号9", "系统", "info", "执行开始"))  # 账号1还在跑时另开
+        t.add(("22:00:03", "—", "系统", "error", "运行异常"))
+        t.add(("22:00:04", "账号9", "系统", "info", "结束"))
+        t.add(("22:00:05", "账号1", "停止", "info", "已中途停止，执行结束"))
+        t.add(("22:00:06", "账号1", "系统", "info", "结束"), everywhere=True)  # 最后一个结束
+        self.assertEqual(t.accounts, ["账号1", "账号9"])
+        stamps = lambda: [t.rows[i][0][-2:] for i in t.view]
+        t.set_filter("账号9")
+        self.assertEqual(stamps(), ["01", "02", "03", "04"])
+        t.set_filter("账号1")
+        self.assertEqual(stamps(), ["00", "03", "05", "06"])
+        t.set_filter(None)  # 全部账号：整体的开始、结束和中途停止显示，中间单个账号的开始、结束不显示
+        self.assertEqual(stamps(), ["00", "01", "03", "05", "06"])
+
     def test_current_result_does_not_finish_another_accounts_row(self):
         other = "账号2 · 存档 2"
         self.execute_fulushou()

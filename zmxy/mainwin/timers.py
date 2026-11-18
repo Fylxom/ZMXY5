@@ -160,6 +160,9 @@ class TimersMixin:
 
     def _retry_due(self, item: str, key: str) -> list[Queued]:
         user, slot = globalcfg.split_key(key)
+        if item in globalcfg.CLOCK_ITEMS:  # 只重做失败的那个存档；存档空着 = 账号级部分（WIDE_SLOT）
+            return [(acc, globalcfg.WIDE_SLOT if slot is None else slot, globalcfg.queue_id(item)) for acc, slots in globalcfg.targets(self.store, item)
+                    if acc.get("username") == user and (slot is None or slot in slots)]
         return [(acc, slot, item) for acc, slots in globalcfg.targets(self.store, item)
                 if acc.get("username") == user and slot in slots]
 
@@ -211,20 +214,43 @@ class TimersMixin:
         self.store.save()
 
     def _timed_failed(self, name: str, r: core.TaskResult) -> None:
-        """按开放时段的定时登录时网络失败：在同一开放时段里给这个存档约好下一次（timeplan.schedule_retry），记进定时记录。"""
+        """定时登录时网络失败：给这个存档约好下一次，记进定时记录。按开放时段的在同一时段里重试（timeplan.schedule_retry）；
+        按时刻的当天重试（globalcfg.schedule_retry），只重做这一个存档 / 账号级部分。"""
         queued = self.timed_items.get(name)
         if queued is None or r.task != "login" or r.status != core.ERROR or not timeplan.network_failure(r.detail or ""):
             return
         acc, slot, tid = queued
-        if tid not in timeplan.TIMER_IDS:
+        # 刚确认的“联网了”不可信（2026-11-16 00:15 电脑没联网，网络检测却过了：解析和连网关都没报错，登录 4399 时 SSLEOF）：
+        # 作废它，下次登录（包括下面约的重试）先等网络真的通了；一直不通就照 _net_ready 的规矩等，按时刻的会再到点
+        self._net_ok_until = 0.0
+        item = globalcfg.kind_of(tid)
+        if tid not in timeplan.TIMER_IDS and item is None:
             return
-        cfg = globalcfg.section(self.store, tid)
-        key = globalcfg.retry_key(acc.get("username", ""), slot)
-        at = timeplan.schedule_retry(tid, cfg, key, servertime.clock())
+        cfg = globalcfg.section(self.store, item or tid)
+        key = globalcfg.retry_key(acc.get("username", ""), slot)  # 按时刻的账号级部分 slot = WIDE_SLOT（0）→ 键里存档空着
+        if item is not None:
+            at = globalcfg.schedule_retry(self.store, item, key, servertime.clock())
+        else:
+            at = timeplan.schedule_retry(tid, cfg, key, servertime.clock())
         self.store.save()
         n = ((cfg.get("retry") or {}).get(key) or {}).get("n")
-        self._timed_note(self.store.label(acc), "info", f"「{self._title(tid)}」连不上服务器，" +
-                         (f"{at} 第 {n} 次重试" if at else "重试次数用完或这个时段来不及了，这次不做了"))
+        where = self.store.label(acc) + (f" · 存档 {slot}" if item is not None and slot else "")
+        self._timed_note(where, "info", f"「{self._title(tid)}」连不上服务器，" +
+                         (f"{at} 第 {n} 次重试" if at else "重试次数用完或" + ("今天" if item else "这个时段") + "来不及了，这次不做了"))
+
+    def _on_timed_net(self, data: tuple[str, str]) -> None:
+        """周常定时的自动配置（只读登录）连不上：和执行时登录失败一样约重试。"""
+        name, detail = data
+        self._timed_failed(name, core.TaskResult("login", core.ERROR, detail))
+
+    def _clock_parts(self, acc: dict[str, Any], accounts: list, tid: str) -> dict[str, tuple[dict[str, Any], int, str]]:
+        """按时刻的定时项：执行项名字 → (账号条目, 存档 / 账号级 = WIDE_SLOT, 定时队列 id)，登录时网络失败只重做这一项。"""
+        label = self.store.label(acc)
+        out = {}
+        for a in accounts:
+            record = a.config.record_index + 1
+            out[a.name] = (acc, globalcfg.WIDE_SLOT if a.name == self.store.wide_name(label, record) else record, tid)
+        return out
 
     # ---- 按养成周（周常、上古蛮荒）：新的养成周开始那天等游戏更新
     def _growth_wait(self, item: str) -> bool:
@@ -279,16 +305,23 @@ class TimersMixin:
         """到点执行一项，不弹任何框。返回 False = 账号正在执行，下次再试。"""
         name, title, user = self.store.label(acc), self._title(tid), acc.get("username", "")
         item = globalcfg.kind_of(tid)
+        clock_parts: dict = {}
         try:
             if item is not None:  # 按时刻的定时项：存档用定时里选的，任务和选项用页面上的
                 found = dict((a.get("username"), s) for a, s in globalcfg.targets(self.store, item))
                 if user not in found:  # 等的时候被关掉了
                     return True
-                if item == globalcfg.WEEKLY:
-                    return self._run_weekly_timed(acc, found[user])
-                accounts = (self._daily_accounts(acc, found[user]) if item == globalcfg.DAILY
-                            else self._ancient_accounts(acc, found[user]) if item == globalcfg.ANCIENT
+                slots, wide = found[user], True
+                if slot is not None:  # 网络失败后的重试：只做失败的那个存档；WIDE_SLOT = 只做账号级部分
+                    if slot != globalcfg.WIDE_SLOT and slot not in slots:
+                        return True
+                    slots, wide = ([], True) if slot == globalcfg.WIDE_SLOT else ([slot], False)
+                if item == globalcfg.WEEKLY:  # 周常重做时先自动配置（只读次数），做过的不会再做；账号级部分失败就整个账号再来
+                    return self._run_weekly_timed(acc, slots or found[user])
+                accounts = (self._daily_accounts(acc, slots, wide) if item == globalcfg.DAILY
+                            else self._ancient_accounts(acc, slots) if item == globalcfg.ANCIENT
                             else self.store.wide_accounts([acc], self.wide, self._cookie_saver, globalcfg.ALLIANCE))
+                clock_parts = self._clock_parts(acc, accounts, tid)
                 if not accounts:
                     self._timed_note(name, "info", f"「{title}」选中的存档都没有勾选任务，没有执行")
                     return True
@@ -316,16 +349,18 @@ class TimersMixin:
         self._index_targets()
         if item is None:  # 登录时网络失败要知道是哪个定时，好约重试
             self.timed_items.update({a.name: (acc, slot, tid) for a in accounts})
+        else:
+            self.timed_items.update(clock_parts)
         timerlog.write(name, "定时", STATUS_LABEL["info"], f"「{title}」到点，开始执行")
         self._launch(accounts, f"定时「{title}」", stay=True, timed=frozenset(a.name for a in accounts))  # 不抢页面：留在用户正在看的那一页
         return True
 
-    def _daily_accounts(self, acc: dict[str, Any], slots: list[int]) -> list:
+    def _daily_accounts(self, acc: dict[str, Any], slots: list[int], wide: bool = True) -> list:
         """“日常和活动”：和对这个账号点“执行”一样（账号级任务先做、每账号一次，各存档做日常 / 活动页的勾选），只是存档换成定时里选的。
-        跳过周常、有自己定时项的任务（斗神、通天河等），联盟贡献归“联盟贡献”定时管的也跳过。"""
+        跳过周常、有自己定时项的任务（斗神、通天河等），联盟贡献归“联盟贡献”定时管的也跳过。wide=False：不做账号级部分（重试某个存档时）。"""
         saver = self._cookie_saver(acc)
         out = []
-        for item in self.store.wide_accounts([acc], self.wide, self._cookie_saver):
+        for item in self.store.wide_accounts([acc], self.wide, self._cookie_saver) if wide else ():
             tasks = tuple(t for t in item.tasks if self._daily_keep(acc, t) and not self._unpicked(acc, None, t))
             if tasks:
                 out.append(replace(item, tasks=tasks))
@@ -410,6 +445,7 @@ class TimersMixin:
         self._index_targets()
         stop = threading.Event()
         names = frozenset([a.name for a in bases] + [a.name for a in wides])
+        self.timed_items.update(self._clock_parts(acc, [a for a in bases + wides if a.name in names], globalcfg.queue_id(globalcfg.WEEKLY)))
         self._add_log("—", "系统", "info", "定时「周常」执行开始")
         timerlog.write(name, "定时", STATUS_LABEL["info"], "「周常」到点，先自动配置再执行")
         self._jump_to_log(stay=True)
@@ -426,7 +462,10 @@ class TimersMixin:
             try:
                 value = core.read_auto(base, plan.specs, plan.reserve)
             except Exception as exc:
-                self.events.put(("timed_note", (base.name, "error", f"「周常」自动配置失败，这个存档不执行：{read_error(exc)}")))
+                why = read_error(exc)
+                self.events.put(("timed_note", (base.name, "error", f"「周常」自动配置失败，这个存档不执行：{why}")))
+                if timeplan.network_failure("登录/进入角色失败：" + why):  # 连不上：和执行时登录失败一样约重试
+                    self.events.put(("timed_net", (base.name, "登录/进入角色失败：" + why)))
                 continue
             self.events.put(("auto_store", (plan.acc, slot, value)))
             ids, times = weekly_plan_ids(plan, slot, value)

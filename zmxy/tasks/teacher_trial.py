@@ -39,6 +39,7 @@ SIDES = (("master", "师傅"), ("student", "徒弟"))
 START_DELAY, SETTLE_DELAY, REWARD_DELAY = 0.6, 1.4, 1.0
 MAX_TIMES = 18
 MAX_MISSES = 3  # 连续几场没有奖励就停
+MAX_RECONNECTS = 2  # 一次执行里连接断开（不是被踢）最多重新登录几次接着打
 
 
 class NoReward(p.AllianceError):
@@ -251,15 +252,31 @@ def claim(owner, role: str, trace: TrialTrace) -> tuple[dungeon.Gains, int | Non
     return gains, next((n for n in seen if n is not None), None)
 
 
+def _relogin_dropped(ctx: TaskContext, student) -> bool:
+    """师傅、徒弟两条主连接里断了的（请求超时、网络断开，不是被踢）重新登录。有断了的、并且都登回来了才返回 True。"""
+    dropped = [s for s in (ctx.session, student) if getattr(s, "dropped", False) is True]
+    if not dropped:
+        return False
+    try:
+        for s in dropped:
+            s.relogin()
+    except Exception:
+        return False
+    return True
+
+
 def _rounds(ctx: TaskContext, student, owner, role: str, goal: int, used: int, limit: int) -> tuple[dungeon.Gains, int, int, str | None]:
     """一场接一场打到 goal 次。返回 (奖励, 完成次数, 最新已用次数, 停止原因)。"""
-    gains, done, misses = dungeon.Gains(), 0, 0
+    gains, done, misses, reconnects = dungeon.Gains(), 0, 0, 0
+    recheck = False  # 上一场已经结算、查奖励时断线：重登后先补查这一场的奖励（只读），不另开一场
     while done < goal:
         if ctx.stopped:
             return gains, done, used, "已被用户停止"
         trace = TrialTrace()
         try:
-            one_battle(ctx, student, role, trace)
+            if not recheck:
+                one_battle(ctx, student, role, trace)
+            recheck = False
             got, seen = claim(owner, role, trace)
         except NoReward as exc:
             # 真机 2026-10-04：连打 5 次后第 6 次被判“未击败boss”，同一版本马上再跑又成功、周计数没动 → 偶发。
@@ -270,6 +287,13 @@ def _rounds(ctx: TaskContext, student, owner, role: str, goal: int, used: int, l
                 return gains, done, used, f"第 {done + 1} 次连续 {misses} 场没有奖励：{exc}"
             continue
         except p.AllianceError as exc:
+            # 连接断了（不是被踢）：重新登录接着打。领奖（写）断线会是 UncertainOutcome，不走这里
+            if reconnects < MAX_RECONNECTS and not ctx.stopped and _relogin_dropped(ctx, student):
+                reconnects += 1
+                recheck = trace.failed == "奖励查询"
+                ctx.log(f"师徒试炼 {done + 1}/{goal} 连接断开（{exc}），已重新登录（第 {reconnects}/{MAX_RECONNECTS} 次），"
+                        f"{'补查这一场的奖励' if recheck else '换一场重打'}；{trace.note()}")
+                continue
             return gains, done, used, f"第 {done + 1} 次失败：{exc}；{trace.note()}"
         except UncertainOutcome as exc:
             raise UncertainOutcome(f"已完成 {done} 次；第 {done + 1} 次；{trace.note()}；{exc}") from exc
